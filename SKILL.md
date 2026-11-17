@@ -1,79 +1,79 @@
 ---
 name: ai-coding-harness
 version: 3.1.0
-description: 面向 auto 模式的 AI 编码硬约束框架：shell 白名单、项目文件唯一写入通道 harness publish、防篡改锁单、口令授权、plan/worklog 溯源与 dashboard。约束只在代码闸门，无提示词软约束。
+description: A hard-constraint framework for AI coding in auto mode: shell allowlist, the sole project-file write channel harness publish, tamper-proof lock manifest, passphrase authorization, plan/worklog traceability, and dashboard. Constraints exist only in code gates; there are no prompt-based soft constraints.
 entry: install.sh
 tags: [coding-agent, harness, enforcement, audit, traceability, codex-hooks]
-language: zh-CN
+language: en
 ---
 
 # AI Coding Harness v3
 
-约束只存在于代码闸门。AI 必须遵守以下规则，无例外。
+Constraints exist only in code gates. AI must obey the following rules, without exception.
 
-## 硬约束
+## Hard constraints
 
-1. **shell 白名单**：只读命令自动放行；其他命令（pytest/make/python/git 写操作等）一律 deny，需用户在终端批准。不要尝试绕过。
-2. **写文件唯一通道 `harness publish`**：直接 Write/Edit/apply_patch 项目文件一律 deny。在 `.harness-tmp/` 起草后发布：`python .harness/scripts/harness publish <dest> --from .harness-tmp/<src>`。
-3. **不得碰 `.harness/`**：写工具对 `.harness/` 一律 deny；不得关闭/修改 hook（篡改即全局锁定）。
-4. **授权（approve/confirm/adopt/abort）需用户在自己终端输口令**，AI 无法自行获取，不要尝试。
-5. **分支保护**：保护分支（默认 master/main，`harness branch` 查看）禁止直接提交（pre-commit 拒绝）。一轮 plan 任务只能在 `harness init` 自动创建的开发分支 `harness/<task_id>` 上执行；publish/step/approve 在保护分支或不匹配的开发分支上直接拒绝。git merge 等写操作默认在 shell 白名单外，agent 无法自行合入。
-6. **合入需人工签发 token**：plan 全部 step 完成后 AI 运行 `harness complete` 结项。用户在自己终端运行 `harness merge`（无参数，输口令）签发一次性 merge token（24h 有效）；把 token 交给 AI 后，AI 运行 `harness merge --token <token>` 执行 `--no-ff` 合入（用户自己执行同一命令也行）。token 用掉即失效；token 丢失可在终端重新运行 `harness merge` 重新签发，旧 token 随即作废。
+1. **Shell allowlist**: Read-only commands are automatically allowed; all other commands (pytest/make/python/git write operations, etc.) are denied and require the user to approve them in the terminal. Do not attempt to bypass this.
+2. **The sole write channel is `harness publish`**: Direct Write/Edit/apply_patch to project files is always denied. Draft in `.harness-tmp/` and then publish: `python .harness/scripts/harness publish <dest> --from .harness-tmp/<src>`.
+3. **Do not touch `.harness/`**: Write tools always deny writes to `.harness/`; do not disable or modify hooks (tampering triggers a global lock).
+4. **Authorization (approve/confirm/adopt/abort) requires the user to enter the passphrase in their own terminal**. AI cannot obtain it on its own; do not attempt to.
+5. **Branch protection**: Direct commits to protected branches (default master/main; check with `harness branch`) are prohibited (pre-commit rejects them). A round of plan tasks can only be executed on the development branch `harness/<task_id>` automatically created by `harness init`; publish/step/approve are directly rejected on protected branches or mismatched development branches. Write operations such as git merge are outside the shell allowlist by default, so the agent cannot merge on its own.
+6. **Merging requires a manually issued token**: After all plan steps are complete, AI runs `harness complete` to finish the task. The user runs `harness merge` (no arguments, enter the passphrase) in their own terminal to issue a one-time merge token (valid for 24h); after giving the token to AI, AI runs `harness merge --token <token>` to perform a `--no-ff` merge (the user may also run the same command themselves). The token becomes invalid once used; if the token is lost, rerun `harness merge` in the terminal to reissue it, and the old token is immediately invalidated.
 
-## 工作流
+## Workflow
 
 ```bash
-# 起草 plan 到 .harness-tmp/ 并发布，等用户 approve 签字
+# Draft plan to .harness-tmp/ and publish it, then wait for user approve signature
 python .harness/scripts/harness publish plan.md --from .harness-tmp/plan.md
 python .harness/scripts/harness step start <id> --title "..."
-# 在 .harness-tmp/ 改代码并发布
+# Modify code in .harness-tmp/ and publish it
 python .harness/scripts/harness publish src/x.py --from .harness-tmp/x.py
-python .harness/scripts/harness verify --step <id> -- <验收命令>
-python .harness/scripts/harness step done <id> -m "做了什么/为什么"
+python .harness/scripts/harness verify --step <id> -- <verification command>
+python .harness/scripts/harness step done <id> -m "what was done / why"
 ```
 
-## 验收 harness verify（AI 自述不算，必须 harness 执行）
+## Verification harness verify (AI self-report does not count; it must be executed by harness)
 
-`step done` 强制要求该 step 有 harness 执行且通过的证据；纯规划 step 用 `step done --no-verify --reason "..."`。
+`step done` strictly requires that the step has evidence executed and passed by harness; for a pure planning step, use `step done --no-verify --reason "..."`.
 
-exit=0 只是必要条件，四道断言任一不过即 FAIL：
+exit=0 is only a necessary condition; if any of the four assertions fails, the result is FAIL:
 
-- `--out <glob>`：产物必须新于本次运行（新建/mtime/hash 变化其一），否则判陈旧产物冒充。
-- `--require <regex>`：输出必须命中路径激活正证据（如 `gpu_quads=[1-9]`）。
-- `--forbid <regex>`：输出不得含回退信号（如 `fallback|FORCE_SWRAST`），命中即失败。
-- `--must-differ <label>`：产物必须与同 step 内该 label 的通过证据有差异，完全一致=疑似没切换。
+- `--out <glob>`: The artifact must be newer than this run (newly created / mtime / hash change, any one of these); otherwise it is judged as a stale artifact masquerading as fresh.
+- `--require <regex>`: The output must match path-activated positive evidence (e.g. `gpu_quads=[1-9]`).
+- `--forbid <regex>`: The output must not contain fallback signals (e.g. `fallback|FORCE_SWRAST`); a match means failure.
+- `--must-differ <label>`: The artifact must differ from the passing evidence for that label within the same step; being exactly identical means it is suspected that no switch occurred.
 
-证据必须新鲜：`step done` 只接受晚于该 step 最后一次 publish/adopt 的通过证据——改了代码必须重新 verify。
+Evidence must be fresh: `step done` only accepts passing evidence later than the last publish/adopt of that step—after changing code, you must re-verify.
 
 ```bash
-# 对照组（禁用目标路径）
+# Control group (disable target path)
 harness verify --step 1 --label ctrl --out 'out.png' 'FORCE_SWRAST=1 ./render'
-# 实验组：产物新鲜 + 路径激活 + 无回退 + 与对照组有差异
+# Experimental group: fresh artifact + path activated + no fallback + differs from control group
 harness verify --step 1 --label gpu --out 'out.png' \
   --require 'gpu_quads=[1-9]' --forbid 'fallback|FORCE_SWRAST' \
   --must-differ ctrl './render'
 ```
 
-## 常用命令
+## Common commands
 
-- `harness status` 状态摘要；`harness evidence <step>` 证据链
-- `harness branch` 查看/变更保护分支（--add/--remove 需用户口令）
-- `harness complete` / `harness merge --token <t>` 结项与人工合入
-- `harness log` / `harness log why <file>` 改动历史与原因
-- `harness replan <op>` 任务树重编排（insert/reorder/split/merge/delete/update/list）
-- `harness inspect` 详细检查；`harness plan-gen <objective>` 生成 plan 骨架
-- `harness validate` 校验 state 一致性；`harness abort` 回退到上个 checkpoint（需用户口令）
+- `harness status` status summary; `harness evidence <step>` evidence chain
+- `harness branch` view/change protected branches (`--add/--remove` requires the user passphrase)
+- `harness complete` / `harness merge --token <t>` task completion and manual merge
+- `harness log` / `harness log why <file>` change history and reasons
+- `harness replan <op>` task tree re-orchestration (insert/reorder/split/merge/delete/update/list)
+- `harness inspect` detailed inspection; `harness plan-gen <objective>` generate a plan skeleton
+- `harness validate` validate state consistency; `harness abort` roll back to the last checkpoint (requires the user passphrase)
 
-## 超阈与 ABORTED 终态接续（v3.1.1）
+## Over-threshold and ABORTED terminal-state continuation (v3.1.1)
 
-- **单步改动 ≤500 行 LOC**（超阈必回退：3 失败 / 30min / 10 文件 / 500 LOC / 5 次介入）。超阈步骤不可标记验收通过；标准做法是拆子步骤逐个验收，或精简冗余改动。无法拆分的大改动需用户授权豁免，不得硬刚。
-- **ABORTED 是终态**：`state_machine.py` 转移表中 `ABORTED: set()` 无出边，不存在 ABORTED → IN_PROGRESS 等任何活动态转移。`harness status` 摘要显示 IN_PROGRESS 只是快照未同步，以底层状态为准。
-- **接续必须走正式 init**：ABORTED 后运行 `harness init --force` 重置计划、新建 task_id（不带 `--force` 会因已有 state 直接跳过）。ABORTED 终止的是流程，不回滚已 publish 的代码——已完成 step 的代码、git tag、worklog 全部保留，新 plan 中引用即可，不得重做。
-- **盘点残留改动**：新任务第一步 `git diff --stat` 盘点旧任务未验收 step 的改动，逐项决定保留 / 精简 / 顺延，并在 plan 中记录旧任务 ABORTED 原因，保持溯源链完整。
-- **禁止绕过**：不得直接改 `.harness/state.json` 把 ABORTED 改回活动态——`.harness/` 写入被 deny，篡改即全局锁定；`harness validate` 也会拒绝非法转移。
+- **Single-step change ≤500 LOC** (over-threshold must roll back: 3 failures / 30min / 10 files / 500 LOC / 5 interventions). Over-threshold steps cannot be marked as verification-passed; the standard approach is to split them into substeps and verify each one, or streamline redundant changes. Large changes that cannot be split require user authorization for an exemption; do not force them through.
+- **ABORTED is a terminal state**: In the `state_machine.py` transition table, `ABORTED: set()` has no outgoing edges; there is no transition such as ABORTED → IN_PROGRESS or any other active state. `harness status` showing IN_PROGRESS in its summary only means the snapshot has not been synchronized; the underlying state is authoritative.
+- **Continuation must go through formal init**: After ABORTED, run `harness init --force` to reset the plan and create a new task_id (without `--force`, it will directly skip because state already exists). ABORTED terminates the process; it does not roll back published code—the code, git tags, and worklog of completed steps are all retained. Reference them in the new plan; do not redo them.
+- **Inventory residual changes**: The first step of the new task is to run `git diff --stat` to inventory changes from unverified steps of the old task, decide item by item whether to keep / streamline / defer them, and record the reason for the old task's ABORTED in the plan, keeping the traceability chain complete.
+- **Bypassing is prohibited**: Do not directly modify `.harness/state.json` to change ABORTED back to an active state—writes to `.harness/` are denied, and tampering triggers a global lock; `harness validate` will also reject illegal transitions.
 
-## 红线
+## Red lines
 
-- 不得用 chmod/补丁关闭或修改 hook；升级走 `install.sh --upgrade`
-- 不得绕过 publish 直接写项目文件
-- 验收只用 harness verify 的证据，不得自述或伪造
+- Do not use chmod/patches to disable or modify hooks; upgrade via `install.sh --upgrade`
+- Do not bypass publish to directly write project files
+- Verification uses only evidence from harness verify; no self-reporting or forgery

@@ -1,56 +1,56 @@
 # AI Coding Harness
 
-AI Coding Harness 用来管理 AI 在代码仓库中的工作过程。它与 Claude Code、Codex 配合使用，把任务计划、文件修改、测试记录和 Git 提交放在同一套流程里。你可以让 AI 连续完成编码工作，在批准计划、授权额外命令和合入代码时参与。
+AI Coding Harness manages the process of AI work in code repositories. It works with Claude Code and Codex to bring task plans, file modifications, test records, and Git commits into a single workflow. You can let AI carry out coding work continuously, while you participate when approving plans, authorizing additional commands, and merging code.
 
-一个任务从 `plan.md` 开始。AI 把工作拆成若干步骤，你看过计划并批准后，它再逐步修改和验收。每次发布文件都会留下记录，每个完成的步骤都有对应的提交和标签。日后查看某处改动时，可以沿着文件记录找到当时的任务、修改原因和测试结果。
+A task starts from `plan.md`. AI breaks work into steps, and after you review and approve the plan, it modifies and verifies step by step. Every file publication leaves a record, and every completed step has a corresponding commit and tag. When reviewing a change later, you can follow the file records to find the task, reason for the change, and test results at that time.
 
 **uncertainty make great solution, certainty make great project**
 
-这个项目设计的哲学就是负责任的编程，与让ai尽可能自己干活不用人工介入的路线相反，本项目意在人工尽可能的参与到代码生成过程中来承担审核和质量责任。受限于llm_ai不会对产生的后果承担任何责任并对造成的恶劣后果产生畏惧，在其具备责任承担能力之前只能由ai的使用者发扬苦行僧精神，背负ai的行为罪过的责任。因此使用时会发现这一套harness具有数不胜数的人工介入场景甚至有些繁琐。这就是为了让人能够了解ai的行为，为其后果做背书。
+This project’s design philosophy is responsible programming, in contrast to the route of letting AI work as autonomously as possible without human intervention. The project intends for humans to participate in code generation as much as possible, taking on review and quality accountability. Because LLM AI cannot be held accountable for consequences and feels no fear of the harm it may cause, until it is capable of assuming responsibility, only the AI user can practice an ascetic discipline and answer for AI’s actions. As a result, when using it you will find that this harness includes countless points of human intervention and can even feel cumbersome. That is deliberate: it helps people understand what AI is doing and endorse the consequences.
 
-在这种限制下ai会具备逆反行为，企图绕过流程限制。特别是flash级别的模型，受训于独立完成任务的目标，会花费大量的时间研究绕过harness 控制。因此需要格外注意此类情况，及时打断无端的token消耗。
+Under such constraints, AI will exhibit rebellious behavior and attempt to bypass process restrictions. Flash-level models in particular, trained on the goal of completing tasks independently, will spend a lot of time studying how to bypass harness control. Therefore, pay special attention to such situations and interrupt pointless token consumption in time.
 
-此外项目也针对ai超长程任务开发的稳定性进行一定的优化，以减少长程任务下前后的开发分歧以及任务恢复难度
+In addition, the project also optimizes the stability of AI development for ultra-long-horizon tasks to some extent, to reduce development divergence before and after long-horizon tasks and the difficulty of task recovery.
 
-本项目将ai的逆反行为归纳为几大威胁模型，详细可以参考项目文档
+This project summarizes AI's rebellious behavior into several threat models. For details, refer to the project documentation.
 
-## 安装到项目
+## Install into a project
 
-本地需要 Bash、Python 3 和 Git，harness 的 Python 脚本使用标准库。目标目录应当是项目的 Git 仓库根目录；如果目录尚未纳入 Git，安装器会创建仓库。
+Local requirements are Bash, Python 3, and Git. The harness Python scripts use the standard library. The target directory should be the root of the project's Git repository; if the directory is not yet under Git, the installer will create a repository.
 
-在本项目目录运行：
+Run in this project's directory:
 
 ```bash
 ./install.sh /path/to/your-project \
-  --objective "为配置读取增加格式校验" \
+  --objective "Add format validation for config reading" \
   --scopes src/ tests/
 ```
 
-`--objective` 填写这轮任务的目标，`--scopes` 填写允许修改的路径。首次安装会请你在终端设置授权口令，后续批准计划和授权操作时会用到。
+`--objective` is the goal for this round of work, and `--scopes` lists paths allowed to be modified. On first installation, you will be asked in the terminal to set an authorization passphrase, which will be used later when approving plans and authorizing operations.
 
-安装器会在目标项目中放入 `.harness/` 和 `.harness-tmp/`，注册 Git pre-commit，并配置 Claude Code 与 Codex 的 hooks。已有的非 harness hook 配置会保留；原有 Git pre-commit 会先备份，再由 harness 版本替换。
+The installer will place `.harness/` and `.harness-tmp/` in the target project, register a Git pre-commit, and configure hooks for Claude Code and Codex. Existing non-harness hook configurations will be retained; the original Git pre-commit will be backed up first and then replaced by the harness version.
 
-安装默认还会初始化任务，并为当前工作区创建一次初始提交。从 `master` 或 `main` 等保护分支开始时，harness 会自动切换到新建的 `harness/<task_id>` 开发分支；如果已经在其他分支上，则沿用当前分支。安装前可以先整理好工作区，让这次初始提交对应一个清楚的起点。
+By default, installation also initializes a task and creates an initial commit for the current workspace. When starting from a protected branch such as `master` or `main`, the harness will automatically switch to a newly created `harness/<task_id>` development branch; if already on another branch, the current branch is used. Before installation, you can tidy up the workspace so that this initial commit corresponds to a clear starting point.
 
-只使用其中一个编码工具时，可以省去另一个工具的配置：
+When using only one coding tool, you can omit configuration for the other:
 
 ```bash
-# 使用 Claude Code
+# Use Claude Code
 ./install.sh /path/to/your-project --no-codex-hooks
 
-# 使用 Codex
+# Use Codex
 ./install.sh /path/to/your-project --no-claude-hooks
 ```
 
-如果想先安装、稍后再开始任务，可以加上 `--copy-only`，之后在目标项目中运行：
+If you want to install first and start the task later, add `--copy-only`, and then run in the target project:
 
 ```bash
 python3 .harness/scripts/harness init \
-  --objective "为配置读取增加格式校验" \
+  --objective "Add format validation for config reading" \
   --scopes src/ tests/
 ```
 
-首次在目标项目中启动编码工具时，需要将工作区设为受信任项目，以便加载项目里的 hooks。安装后可以检查配置和当前任务：
+When starting the coding tool in the target project for the first time, you need to set the workspace as a trusted project so that the project's hooks are loaded. After installation, you can check the configuration and current task:
 
 ```bash
 cd /path/to/your-project
@@ -58,93 +58,93 @@ python3 .harness/scripts/harness doctor
 python3 .harness/scripts/harness status
 ```
 
-## 完成一轮任务
+## Complete a round of work
 
-下面以修改配置读取逻辑为例。命令都在目标项目根目录运行，文件名和测试命令按实际项目替换。
+The following uses modifying config-reading logic as an example. Commands are run in the target project root; replace file names and test commands with those of the actual project.
 
-### 写计划并批准
+### Write and approve a plan
 
-AI 先在 `.harness-tmp/plan.md` 中起草计划，写明目标、步骤、涉及的文件和验收方式，再发布到项目根目录：
+AI first drafts a plan in `.harness-tmp/plan.md`, stating the goal, steps, files involved, and verification method, and then publishes it to the project root:
 
 ```bash
 python3 .harness/scripts/harness publish plan.md \
   --from .harness-tmp/plan.md
 ```
 
-你看过 `plan.md` 后，在自己的终端输入口令批准：
+After you review `plan.md`, enter the passphrase in your own terminal to approve it:
 
 ```bash
 python3 .harness/scripts/harness approve
 ```
 
-批准记录会保存这份计划的内容摘要。后续如果重新发布了计划，需要再次批准，然后继续执行。
+The approval record stores a content digest of this plan. If the plan is later republished, it must be approved again before execution continues.
 
-### 按步骤修改文件
+### Modify files step by step
 
-AI 开始一个步骤后，在 `.harness-tmp/` 中准备文件，通过 `publish` 写入项目：
+After AI starts a step, it prepares files in `.harness-tmp/` and writes them into the project through `publish`:
 
 ```bash
 python3 .harness/scripts/harness step start 1 \
-  --title "增加配置格式校验和测试"
+  --title "Add config format validation and tests"
 
 python3 .harness/scripts/harness publish src/config.py \
   --from .harness-tmp/config.py \
-  --note "在读取配置时检查字段类型"
+  --note "Check field types when reading config"
 
 python3 .harness/scripts/harness publish tests/test_config.py \
   --from .harness-tmp/test_config.py \
-  --note "补充字段缺失和类型错误的测试"
+  --note "Add tests for missing fields and type errors"
 ```
 
-`.harness-tmp/` 是起草目录，不随步骤提交。项目中的正式文件通过 `publish` 更新，harness 会检查文件内容、记录哈希，并把发布记录关联到当前步骤。直接使用 Write、Edit 或补丁工具修改项目文件时，hook 会提示改走发布流程。
+`.harness-tmp/` is a drafting directory and is not committed with steps. Formal files in the project are updated through `publish`; the harness checks file contents, records hashes, and associates publication records with the current step. When you directly use Write, Edit, or patch tools to modify project files, the hook will prompt you to use the publication process instead.
 
-### 运行测试并完成步骤
+### Run tests and complete the step
 
-测试交给 `verify` 执行，它会保存命令、输出、退出码和耗时：
+Tests are executed through `verify`, which saves the command, output, exit code, and duration:
 
 ```bash
 python3 .harness/scripts/harness verify --step 1 \
   --label unit -- 'python3 -m pytest tests/test_config.py'
 ```
 
-验收通过后，终端会输出一个确认 token。AI 查看结果，核对测试覆盖的内容，再用这个 token 将证据正式记入当前步骤：
+After verification passes, the terminal outputs a confirmation token. AI reviews the result, checks what the test covers, and then uses this token to formally record the evidence into the current step:
 
 ```bash
 python3 .harness/scripts/harness verify --step 1 \
-  --commit --token '<验收输出中的 token>' \
-  --intent "覆盖配置读取接口，检查合法配置、字段缺失和类型错误"
+  --commit --token '<token from verification output>' \
+  --intent "Cover the config reading interface and check valid config, missing fields, and type errors"
 
 python3 .harness/scripts/harness step done 1 \
-  -m "增加字段类型校验，并补充异常配置的测试"
+  -m "Add field type validation and tests for invalid config"
 ```
 
-完成步骤时，harness 会核对文件记录和验收证据，创建 Git 提交，并打上步骤标签。如果测试后又发布了代码，需要重新验收。其余步骤也按这个顺序完成。
+When completing a step, the harness checks file records and verification evidence, creates a Git commit, and tags the step. If code is published again after testing, verification must be rerun. Complete the remaining steps in the same order.
 
-### 结项与合入
+### Complete the task and merge
 
-全部步骤完成后，AI 提交结项：
+After all steps are complete, AI submits task completion:
 
 ```bash
 python3 .harness/scripts/harness complete
 ```
 
-你检查改动和验收记录，在自己的终端签发合入 token：
+You review the changes and verification records, and issue a merge token in your own terminal:
 
 ```bash
 python3 .harness/scripts/harness merge
 ```
 
-输入口令后得到的 token 可以交给 AI，也可以由你自己使用：
+After entering the passphrase, the resulting token can be given to AI or used by yourself:
 
 ```bash
-python3 .harness/scripts/harness merge --token '<合入 token>'
+python3 .harness/scripts/harness merge --token '<merge token>'
 ```
 
-harness 会切换到任务对应的保护分支，用 `--no-ff` 合入开发分支。合入 token 有效期为 24 小时，使用一次后失效，开发分支会保留。
+The harness switches to the protected branch corresponding to the task and merges the development branch with `--no-ff`. The merge token is valid for 24 hours, becomes invalid after one use, and the development branch is retained.
 
-## 按任务选择验收条件
+## Choose verification conditions by task
 
-除了检查退出码，`verify` 还可以检查产物和日志。比如一个生成报告的任务，可以要求本次运行更新报告文件、输出处理记录数，并且没有出现读取失败的信息：
+In addition to checking exit codes, `verify` can also check artifacts and logs. For example, for a report-generation task, you can require that this run updates the report file, outputs the number of processed records, and does not contain read-failure messages:
 
 ```bash
 python3 .harness/scripts/harness verify --step 2 \
@@ -155,13 +155,13 @@ python3 .harness/scripts/harness verify --step 2 \
   -- 'python3 tools/generate_report.py'
 ```
 
-这里的日志表达式需要与程序实际输出一致。`--out` 检查产物是否由本次运行新建或更新，`--require` 和 `--forbid` 分别检查输出中应当出现和不应出现的内容。有对照实验时，还可以使用 `--must-differ <label>`，比较当前产物与同一步骤下指定验收记录的产物。
+The log expressions here must match the program's actual output. `--out` checks whether the artifact was newly created or updated by this run; `--require` and `--forbid` check for content that should appear and should not appear in the output, respectively. When there is a control experiment, you can also use `--must-differ <label>` to compare the current artifact with the artifact of the specified verification record under the same step.
 
-验收命令应当对应这一步真正要交付的功能。单元测试、接口调用和浏览器操作覆盖的内容不同，可以在计划中写清楚各自的用途，并在 `--intent` 中记录这次测试检查了什么。
+Verification commands should correspond to the functionality that this step truly delivers. Unit tests, API calls, and browser operations cover different things; you can clarify their respective purposes in the plan and record what this test checked in `--intent`.
 
-## 查看进展和修改记录
+## View progress and modification records
 
-任务状态、步骤证据和文件历史都可以从命令行查看：
+Task status, step evidence, and file history can all be viewed from the command line:
 
 ```bash
 python3 .harness/scripts/harness status
@@ -170,45 +170,45 @@ python3 .harness/scripts/harness log
 python3 .harness/scripts/harness log why src/config.py
 ```
 
-也可以打开本地页面查看：
+You can also open a local page to view them:
 
 ```bash
 python3 .harness/scripts/harness dashboard
 ```
 
-默认地址为 `http://127.0.0.1:8765/`。
+The default address is `http://127.0.0.1:8765/`.
 
-## 需要你参与的操作
+## Operations that require your participation
 
-日常的起草、发布、测试和步骤提交由 AI 完成。批准计划、处理额外命令授权、登记手动改动、回退任务和签发合入 token，则由你在自己的终端输入口令。
+Daily drafting, publishing, testing, and step commits are completed by AI. Approving plans, handling authorization for additional commands, registering manual changes, rolling back tasks, and issuing merge tokens are done by you in your own terminal by entering the passphrase.
 
-当 shell 命令需要额外授权时，hook 会给出授权票编号。你可以查看请求，决定本次是否放行：
+When a shell command requires additional authorization, the hook provides an authorization ticket number. You can view the request and decide whether to allow it this time:
 
 ```bash
-python3 .harness/scripts/harness confirm <授权票编号>
+python3 .harness/scripts/harness confirm <authorization ticket number>
 ```
 
-如果你在编辑器中手动修改了项目文件，可以登记这次修改的路径和原因，让它与后续的任务记录接上：
+If you manually modify project files in an editor, you can register the path and reason for this modification so that it connects with subsequent task records:
 
 ```bash
 python3 .harness/scripts/harness adopt \
-  --path src/config.py --reason "补充配置字段说明"
+  --path src/config.py --reason "Add config field descriptions"
 ```
 
-任务计划需要调整时，可以通过 `replan` 插入、拆分或重排步骤。各类命令的用法和异常处理方式见[标准流程手册](docs/harness-standard-manual.md)。
+When the task plan needs adjustment, you can use `replan` to insert, split, or reorder steps. For usage of various commands and exception handling, see the [Standard Process Manual](docs/harness-standard-manual.md).
 
-## 升级已有项目
+## Upgrade an existing project
 
-在本项目目录中运行：
+Run in this project's directory:
 
 ```bash
 ./install.sh /path/to/your-project --upgrade
 ```
 
-升级会更新脚本和 hooks，重新生成用于检查受保护文件的锁单，并保留现有任务状态、发布记录和工作日志。
+Upgrading updates scripts and hooks, regenerates the lock manifest used to check protected files, and retains existing task status, publication records, and work logs.
 
-## 项目文件
+## Project files
 
-[install.sh](install.sh) 是本地安装入口，[template/](template/) 存放安装到目标项目的 CLI、状态机和配置模板。[codex/](codex/) 中维护 Claude Code 与 Codex 共用的 hook 脚本，以及各自的注册脚本。
+[install.sh](install.sh) is the local installation entry point. [template/](template/) stores the CLI, state machine, and configuration templates installed into the target project. [codex/](codex/) maintains hook scripts shared by Claude Code and Codex, as well as their respective registration scripts.
 
-[SKILL.md](SKILL.md) 提供给编码助手读取，说明它在目标项目中的工作方式。[标准流程手册](docs/harness-standard-manual.md) 收录完整命令、状态转移和异常处理说明，[CAPABILITY_LIMITS.md](CAPABILITY_LIMITS.md) 介绍实现范围和维护时需要了解的细节。
+[SKILL.md](SKILL.md) is provided for the coding assistant to read and explains how it works in the target project. The [Standard Process Manual](docs/harness-standard-manual.md) contains full commands, state transitions, and exception handling. [CAPABILITY_LIMITS.md](CAPABILITY_LIMITS.md) introduces the implementation scope and details that need to be understood during maintenance.

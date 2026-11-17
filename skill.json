@@ -1,9 +1,9 @@
 {
   "name": "ai-coding-harness",
   "version": "3.1.1",
-  "description": "auto 模式 AI 编码硬约束：shell 白名单 + 唯一写入网关 + 防篡改锁单 + 口令授权（stdin+进程树校验+失败限流）+ plan/worklog 溯源 + dashboard。所有约束只存在于代码闸门，无任何提示词软约束。",
+  "description": "Hard constraints for AI coding in auto mode: shell allowlist + sole write gateway + tamper-proof lock manifest + passphrase authorization (stdin + process tree verification + failure throttling) + plan/worklog traceability + dashboard. All constraints exist only in code gates; there are no prompt-based soft constraints.",
   "entry": "install.sh",
-  "language": "zh-CN",
+  "language": "en",
   "author": "harness-team",
   "license": "MIT",
   "tags": [
@@ -17,35 +17,35 @@
     "auto-mode"
   ],
   "triggers": [
-        "工程化约束 AI Agent",
-    "保证 AI coding 质量",
-    "断点恢复",
+    "Engineering constraints for AI Agent",
+    "Ensure AI coding quality",
+    "Checkpoint recovery",
     "Harness",
     "harness",
-    "AI coding 安全",
-    "合规审查",
-    "文件修改审计",
-    "让 AI 不要忘记规范 / 严格执行",
-    "auto 模式 AI 编码约束",
-    "AI 拥有 shell 的安全约束",
-    "shell 白名单 / 命令授权",
-    "项目文件唯一写入通道",
-    "防篡改锁单",
-    "AI coding 安全 / 防破坏",
-    "文件修改审计与回溯",
-    "plan/worklog 溯源"
+    "AI coding safety",
+    "Compliance review",
+    "File modification audit",
+    "Keep AI from forgetting standards / strict enforcement",
+    "Auto-mode AI coding constraints",
+    "Security constraints for AI with shell access",
+    "shell allowlist / command authorization",
+    "Sole write channel for project files",
+    "Tamper-proof lock manifest",
+    "AI coding safety / anti-sabotage",
+    "File modification audit and traceback",
+    "plan/worklog traceability"
   ],
   "capabilities": [
-    "PreToolUse 白名单硬闸门：shell 词法切分（管道/&&/;/$/`<()`/重定向/heredoc 全覆盖），只读命令自动放行，未知命令生成授权票并 deny",
-    "项目文件唯一写入通道 harness publish：路径保护 + 确定性密钥指纹 + 高熵密钥 + 语法检查 + 批量阈值 + 备份 + manifest 留档",
-    "防篡改锁单 fail-closed：hook/CLI/pre-commit/hooks.json 算 hash，损坏时拒绝一切变更类操作（只读仍放行）",
-    "口令授权（不依赖 /dev/tty）：stdin 读口令 + sha256+salt 0600 存储 + 进程树校验（拒绝 agent 进程树）+ 失败限流（3 次锁 60 秒）",
-    "授权票机制：未知命令生成 pending 票，用户 harness confirm 批准（仅一次/总是/永久放行该程序/拒绝），一次性许可用后即焚",
-    "plan/worklog 溯源：plan.md 签字固化 baseline，每 step 是 git tag（harness-sN-*），harness log why <file> 查改动原因",
-    "对账闸门：publish/approve/step done/commit 前用 git status 对账，存在未登记游离改动则拒绝（harness adopt 需口令登记）",
-    "harness abort：口令确认后 git reset --hard 回退到任意 checkpoint tag，并清理未跟踪的新文件",
-    "实时 dashboard：仅依赖标准库 http.server，3 秒刷新，可视化状态/plan 待办/步骤/发布/授权票/拦截",
-    "SessionStart 注入事实（当前 step/plan 待办/最近步骤/锁单状态），不注入行为规范；Stop hook 收尾对账阻断"
+    "PreToolUse allowlist hard gate: shell lexical splitting (full coverage of pipes/&&/;/$/`<()`/redirection/heredoc), read-only commands automatically allowed, unknown commands generate an authorization ticket and are denied",
+    "Sole project-file write channel harness publish: path protection + deterministic key fingerprint + high-entropy key + syntax check + batch threshold + backup + manifest archiving",
+    "Tamper-proof lock manifest fail-closed: hash hook/CLI/pre-commit/hooks.json; when corrupted, reject all mutating operations (read-only operations are still allowed)",
+    "Passphrase authorization (does not rely on /dev/tty): read passphrase from stdin + sha256+salt stored with 0600 + process tree verification (reject agent process tree) + failure throttling (3 failures lock for 60 seconds)",
+    "Authorization ticket mechanism: unknown commands generate a pending ticket; the user runs harness confirm to approve (once/always/permanently allow the program/deny); one-time permits are burned after use",
+    "plan/worklog traceability: plan.md signature solidifies the baseline; each step is a git tag (harness-sN-*); harness log why <file> checks the reason for a change",
+    "Reconciliation gate: reconcile with git status before publish/approve/step done/commit; if unregistered stray changes exist, reject (harness adopt requires passphrase registration)",
+    "harness abort: after passphrase confirmation, git reset --hard rolls back to any checkpoint tag and cleans untracked new files",
+    "Real-time dashboard: only the standard library http.server is used, refresh every 3 seconds, visualize status/plan todos/steps/publications/authorization tickets/interceptions",
+    "SessionStart injects facts (current step/plan todos/recent steps/lock manifest status), does not inject behavioral norms; Stop hook final reconciliation block"
   ],
   "compatibility": {
     "codex_cli": ">=0.158",
@@ -64,16 +64,20 @@
     "template": "template/.harness/"
   },
   "changelog": [
-    {"version": "3.1.1", "date": "2026-11-10", "changes": "文档补充超阈与 ABORTED 终态接续规范：(1) SKILL.md 新增「超阈与 ABORTED 终态接续」节：单步 ≤500 LOC 超阈必拆步/精简，不得硬刚；ABORTED 为终态（state_machine.py 无出边），status 摘要 IN_PROGRESS 仅为快照未同步，以底层状态为准；接续必须 harness init --force 重置计划新建 task_id（不带 --force 会跳过），保留已完成代码/tag/worklog，新 plan 引用不重做；新任务第一步 git diff --stat 盘点残留改动并记录 ABORTED 原因；禁止直接改 state.json 复活任务（.harness/ 写 deny + 篡改锁定 + validate 拒绝非法转移）。"},
+    {
+      "version": "3.1.1",
+      "date": "2026-11-10",
+      "changes": "Documentation adds over-threshold and ABORTED terminal-state continuation specifications: (1) SKILL.md adds an 'Over-threshold and ABORTED terminal-state continuation' section: single-step ≤500 LOC; over-threshold must split steps/streamline, do not force through; ABORTED is terminal (state_machine.py has no outgoing edges); status summary IN_PROGRESS is only an unsynchronized snapshot, the underlying state is authoritative; continuation must use harness init --force to reset the plan and create a new task_id (without --force it will skip), retain completed code/tags/worklog, reference them in the new plan without redoing; the first step of the new task is git diff --stat to inventory residual changes and record the ABORTED reason; directly modifying state.json to revive the task is prohibited (.harness/ writes denied + tamper lock + validate rejects illegal transitions)."
+    },
     {
       "version": "3.1.0",
       "date": "2026-10-29",
-      "changes": "AI 起草区从系统 /tmp 迁移到项目根 .harness-tmp/。(1) pre_tool_use.is_project_file 改为纯 realpath 判定：路径解析到 root 下且不在 .harness-tmp 下才受保护；scratch 内符号链接指向 src/ 解析到 src/ 仍被拒（防绕过）；src/ 内符号链接指向 scratch 只改 scratch 内容，判为无害。(2) harness cmd_publish 允许 .harness-tmp/ 下源文件，拒绝其他项目内源（项目外源仍兼容放行）。(3) _resolve_dest 拒绝 .harness-tmp 作为 publish 目标。(4) is_ignored 硬编码忽略 .harness-tmp/（升级路径上旧 ignore 文件不含该条也不影响对账）。(5) install.sh 无条件幂等确保 .harness-tmp/ 存在且 .gitignore/.harnessignore 含该条（修复 --upgrade 不刷新既有 ignore 文件的缺口）。(6) _redirect_ok 接受 root 参数，允许重定向到 .harness-tmp/。(7) lock_candidates 不含 scratch（可变）。(8) 文案/文档/install 提示统一 .harness-tmp/。"
+      "changes": "AI drafting area migrated from system /tmp to project root .harness-tmp/. (1) pre_tool_use.is_project_file changed to pure realpath determination: only paths resolving under root and not under .harness-tmp are protected; symlinks in scratch pointing to src/ resolve to src/ and are still rejected (anti-bypass); symlinks in src/ pointing to scratch only modify scratch content and are deemed harmless. (2) harness cmd_publish allows source files under .harness-tmp/, rejects other in-project sources (out-of-project sources are still compatibly allowed). (3) _resolve_dest rejects .harness-tmp as a publish destination. (4) is_ignored hardcodes ignoring .harness-tmp/ (on the upgrade path, old ignore files not containing this entry do not affect reconciliation). (5) install.sh unconditionally idempotently ensures .harness-tmp/ exists and .gitignore/.harnessignore contain this entry (fixes the gap where --upgrade does not refresh existing ignore files). (6) _redirect_ok accepts a root parameter, allowing redirection to .harness-tmp/. (7) lock_candidates does not include scratch (mutable). (8) Copy/documentation/install prompts unified to .harness-tmp/."
     },
     {
       "version": "3.0.0",
       "date": "2026-10-20",
-      "changes": "v3 重写为 auto 模式硬约束框架，威胁模型改为「AI 会搞破坏」，所有约束只在代码闸门中。(1) PreToolUse 白名单重写：shell 词法切分覆盖管道/&&/;/$(...)/反引号/<(...)/${...}/重定向/heredoc，引号内命令替换同样抽取分类；只读命令白名单收紧（移除 env/less/uniq/xxd/xargs/tee/sed/awk 等可执行子进程或写文件的命令）；git 子命令白名单 + 禁 -c/--config-env/--output/--ext-diff 等可执行外部程序的参数；find 禁 -exec/-delete 等；sort 禁 -o/--compress-program；rg 禁 --pre；date 禁 -s；前置环境变量只允许 LANG/LC_*/TZ/TERM 等少数，PATH/GIT_EXTERNAL_DIFF 等一律需授权。(2) 单一 CLI 网关 harness：publish/approve/step/confirm/adopt/log/status/abort/dashboard/doctor/passwd，项目文件唯一写入通道，审核（密钥指纹+高熵+语法）+备份+manifest，publish 前对账。(3) 口令授权改 stdin+进程树校验+失败限流，不依赖 /dev/tty（兼容低权限无 pts 服务器）；主防线是口令（AI 不知道、读不到 0600 secret 文件），进程树校验为辅助。(4) 防篡改锁单 fail-closed：hook/CLI/pre-commit/hooks.json 算 hash，损坏拒绝变更（只读放行）。(5) plan/worklog 溯源：每 step 是 git tag，harness log why <file>，harness abort 回退。(6) 实时 dashboard（仅标准库）。已端到端验证：install→publish→approve→step→publish→step done→log/why/status，密钥/语法拦截，锁篡改拒绝，pre-commit 对账拦截，adopt/abort/upgrade，confirm 一次性许可消费，口令失败限流。"
+      "changes": "v3 rewritten as a hard-constraint framework for auto mode; the threat model changed to 'AI will cause damage'; all constraints exist only in code gates. (1) PreToolUse allowlist rewritten: shell lexical splitting covers pipes/&&/;/$(...)/backticks/<(...)/${...}/redirection/heredoc; command substitutions inside quotes are also extracted and classified; read-only command allowlist tightened (removed env/less/uniq/xxd/xargs/tee/sed/awk and other commands that can execute subprocesses or write files); git subcommand allowlist + prohibit arguments such as -c/--config-env/--output/--ext-diff that can execute external programs; find prohibits -exec/-delete etc.; sort prohibits -o/--compress-program; rg prohibits --pre; date prohibits -s; leading environment variables allow only a few such as LANG/LC_*/TZ/TERM; PATH/GIT_EXTERNAL_DIFF etc. all require authorization. (2) Single CLI gateway harness: publish/approve/step/confirm/adopt/log/status/abort/dashboard/doctor/passwd; sole write channel for project files; review (key fingerprint + high entropy + syntax) + backup + manifest; reconcile before publish. (3) Passphrase authorization changed to stdin + process tree verification + failure throttling, not relying on /dev/tty (compatible with low-privilege servers without pts); the main defense line is the passphrase (AI does not know it and cannot read the 0600 secret file); process tree verification is auxiliary. (4) Tamper-proof lock manifest fail-closed: hash hook/CLI/pre-commit/hooks.json; corruption rejects changes (read-only allowed). (5) plan/worklog traceability: each step is a git tag, harness log why <file>, harness abort rollback. (6) Real-time dashboard (standard library only). End-to-end verified: install→publish→approve→step→publish→step done→log/why/status, key/syntax interception, lock tampering rejection, pre-commit reconciliation interception, adopt/abort/upgrade, confirm one-time permit consumption, passphrase failure throttling."
     }
   ]
 }
