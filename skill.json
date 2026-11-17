@@ -1,0 +1,79 @@
+{
+  "name": "ai-coding-harness",
+  "version": "3.1.1",
+  "description": "auto 模式 AI 编码硬约束：shell 白名单 + 唯一写入网关 + 防篡改锁单 + 口令授权（stdin+进程树校验+失败限流）+ plan/worklog 溯源 + dashboard。所有约束只存在于代码闸门，无任何提示词软约束。",
+  "entry": "install.sh",
+  "language": "zh-CN",
+  "author": "harness-team",
+  "license": "MIT",
+  "tags": [
+    "coding-agent",
+    "harness",
+    "enforcement",
+    "audit",
+    "traceability",
+    "safety",
+    "codex-hooks",
+    "auto-mode"
+  ],
+  "triggers": [
+        "工程化约束 AI Agent",
+    "保证 AI coding 质量",
+    "断点恢复",
+    "Harness",
+    "harness",
+    "AI coding 安全",
+    "合规审查",
+    "文件修改审计",
+    "让 AI 不要忘记规范 / 严格执行",
+    "auto 模式 AI 编码约束",
+    "AI 拥有 shell 的安全约束",
+    "shell 白名单 / 命令授权",
+    "项目文件唯一写入通道",
+    "防篡改锁单",
+    "AI coding 安全 / 防破坏",
+    "文件修改审计与回溯",
+    "plan/worklog 溯源"
+  ],
+  "capabilities": [
+    "PreToolUse 白名单硬闸门：shell 词法切分（管道/&&/;/$/`<()`/重定向/heredoc 全覆盖），只读命令自动放行，未知命令生成授权票并 deny",
+    "项目文件唯一写入通道 harness publish：路径保护 + 确定性密钥指纹 + 高熵密钥 + 语法检查 + 批量阈值 + 备份 + manifest 留档",
+    "防篡改锁单 fail-closed：hook/CLI/pre-commit/hooks.json 算 hash，损坏时拒绝一切变更类操作（只读仍放行）",
+    "口令授权（不依赖 /dev/tty）：stdin 读口令 + sha256+salt 0600 存储 + 进程树校验（拒绝 agent 进程树）+ 失败限流（3 次锁 60 秒）",
+    "授权票机制：未知命令生成 pending 票，用户 harness confirm 批准（仅一次/总是/永久放行该程序/拒绝），一次性许可用后即焚",
+    "plan/worklog 溯源：plan.md 签字固化 baseline，每 step 是 git tag（harness-sN-*），harness log why <file> 查改动原因",
+    "对账闸门：publish/approve/step done/commit 前用 git status 对账，存在未登记游离改动则拒绝（harness adopt 需口令登记）",
+    "harness abort：口令确认后 git reset --hard 回退到任意 checkpoint tag，并清理未跟踪的新文件",
+    "实时 dashboard：仅依赖标准库 http.server，3 秒刷新，可视化状态/plan 待办/步骤/发布/授权票/拦截",
+    "SessionStart 注入事实（当前 step/plan 待办/最近步骤/锁单状态），不注入行为规范；Stop hook 收尾对账阻断"
+  ],
+  "compatibility": {
+    "codex_cli": ">=0.158",
+    "python": ">=3.8",
+    "git": ">=2.20"
+  },
+  "dependencies": {
+    "python": ">=3.8",
+    "git": ">=2.20",
+    "packages": []
+  },
+  "files": {
+    "entry": "SKILL.md",
+    "installer": "install.sh",
+    "codex_hooks": "codex/hooks/",
+    "template": "template/.harness/"
+  },
+  "changelog": [
+    {"version": "3.1.1", "date": "2026-11-10", "changes": "文档补充超阈与 ABORTED 终态接续规范：(1) SKILL.md 新增「超阈与 ABORTED 终态接续」节：单步 ≤500 LOC 超阈必拆步/精简，不得硬刚；ABORTED 为终态（state_machine.py 无出边），status 摘要 IN_PROGRESS 仅为快照未同步，以底层状态为准；接续必须 harness init --force 重置计划新建 task_id（不带 --force 会跳过），保留已完成代码/tag/worklog，新 plan 引用不重做；新任务第一步 git diff --stat 盘点残留改动并记录 ABORTED 原因；禁止直接改 state.json 复活任务（.harness/ 写 deny + 篡改锁定 + validate 拒绝非法转移）。"},
+    {
+      "version": "3.1.0",
+      "date": "2026-10-29",
+      "changes": "AI 起草区从系统 /tmp 迁移到项目根 .harness-tmp/。(1) pre_tool_use.is_project_file 改为纯 realpath 判定：路径解析到 root 下且不在 .harness-tmp 下才受保护；scratch 内符号链接指向 src/ 解析到 src/ 仍被拒（防绕过）；src/ 内符号链接指向 scratch 只改 scratch 内容，判为无害。(2) harness cmd_publish 允许 .harness-tmp/ 下源文件，拒绝其他项目内源（项目外源仍兼容放行）。(3) _resolve_dest 拒绝 .harness-tmp 作为 publish 目标。(4) is_ignored 硬编码忽略 .harness-tmp/（升级路径上旧 ignore 文件不含该条也不影响对账）。(5) install.sh 无条件幂等确保 .harness-tmp/ 存在且 .gitignore/.harnessignore 含该条（修复 --upgrade 不刷新既有 ignore 文件的缺口）。(6) _redirect_ok 接受 root 参数，允许重定向到 .harness-tmp/。(7) lock_candidates 不含 scratch（可变）。(8) 文案/文档/install 提示统一 .harness-tmp/。"
+    },
+    {
+      "version": "3.0.0",
+      "date": "2026-10-20",
+      "changes": "v3 重写为 auto 模式硬约束框架，威胁模型改为「AI 会搞破坏」，所有约束只在代码闸门中。(1) PreToolUse 白名单重写：shell 词法切分覆盖管道/&&/;/$(...)/反引号/<(...)/${...}/重定向/heredoc，引号内命令替换同样抽取分类；只读命令白名单收紧（移除 env/less/uniq/xxd/xargs/tee/sed/awk 等可执行子进程或写文件的命令）；git 子命令白名单 + 禁 -c/--config-env/--output/--ext-diff 等可执行外部程序的参数；find 禁 -exec/-delete 等；sort 禁 -o/--compress-program；rg 禁 --pre；date 禁 -s；前置环境变量只允许 LANG/LC_*/TZ/TERM 等少数，PATH/GIT_EXTERNAL_DIFF 等一律需授权。(2) 单一 CLI 网关 harness：publish/approve/step/confirm/adopt/log/status/abort/dashboard/doctor/passwd，项目文件唯一写入通道，审核（密钥指纹+高熵+语法）+备份+manifest，publish 前对账。(3) 口令授权改 stdin+进程树校验+失败限流，不依赖 /dev/tty（兼容低权限无 pts 服务器）；主防线是口令（AI 不知道、读不到 0600 secret 文件），进程树校验为辅助。(4) 防篡改锁单 fail-closed：hook/CLI/pre-commit/hooks.json 算 hash，损坏拒绝变更（只读放行）。(5) plan/worklog 溯源：每 step 是 git tag，harness log why <file>，harness abort 回退。(6) 实时 dashboard（仅标准库）。已端到端验证：install→publish→approve→step→publish→step done→log/why/status，密钥/语法拦截，锁篡改拒绝，pre-commit 对账拦截，adopt/abort/upgrade，confirm 一次性许可消费，口令失败限流。"
+    }
+  ]
+}

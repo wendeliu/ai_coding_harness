@@ -1,0 +1,18 @@
+# harness reconcile 忽略规则（构建产物 / 生成物 / v2.2 遗留文件）
+# 语法：每行一个模式；目录以 / 结尾；无 / 的模式匹配任意层级的 basename。
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+target/
+.venv/
+venv/
+*.log
+worklog.md
+summary.md
+# AI 起草区（无监管 tmp）；is_ignored 已硬编码忽略，此处仅文档化
+.harness-tmp/

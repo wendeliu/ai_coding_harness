@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# ai-coding-harness v3 · git pre-commit gate
+# 安装位置: <project>/.git/hooks/pre-commit
+# 作用: 锁单校验 + 未登记改动对账，任一失败即拒绝提交。
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$ROOT" ] || exit 0
+CLI="$ROOT/.harness/scripts/harness"
+[ -f "$CLI" ] || exit 0
+
+PY="${PYTHON:-python3}"
+exec "$PY" "$CLI" _precommit

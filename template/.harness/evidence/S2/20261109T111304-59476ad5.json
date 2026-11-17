@@ -1,0 +1,25 @@
+{
+  "command": "echo x",
+  "exit_code": 0,
+  "stdout": "x\n",
+  "stderr": "",
+  "elapsed": 0.001,
+  "timed_out": false,
+  "hash": "59476ad5c30eb6a226d979e820070ab8bf94e40df05bf5bf0002fc36bf16590c",
+  "ts": "2026-11-09T11:13:04+08:00",
+  "ts_epoch": 1794193984.1502185,
+  "step": "S2",
+  "label": "",
+  "outputs": [],
+  "checks": [
+    {
+      "kind": "require",
+      "pattern": "NOPE",
+      "ok": false
+    }
+  ],
+  "check_failures": [
+    "--require 未命中: NOPE——目标路径激活的正证据缺失"
+  ],
+  "passed": false
+}

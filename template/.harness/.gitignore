@@ -1,0 +1,5 @@
+pending/
+denials.log
+__pycache__/
+*.pyc
+.harness-tmp/

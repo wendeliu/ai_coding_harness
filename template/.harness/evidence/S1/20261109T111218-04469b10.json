@@ -1,0 +1,17 @@
+{
+  "command": "./cmd.sh",
+  "exit_code": 127,
+  "stdout": "",
+  "stderr": "/bin/sh: 1: ./cmd.sh: not found\n",
+  "elapsed": 0.001,
+  "timed_out": false,
+  "hash": "04469b10a0aff6e427a5cc329a791b2ffbf4e699c63c579093e5312c3bdb43b5",
+  "ts": "2026-11-09T11:12:18+08:00",
+  "ts_epoch": 1794193938.8738158,
+  "step": "S1",
+  "label": "",
+  "outputs": [],
+  "checks": [],
+  "check_failures": [],
+  "passed": false
+}

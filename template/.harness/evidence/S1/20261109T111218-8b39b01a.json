@@ -1,0 +1,25 @@
+{
+  "command": "./cmd.sh",
+  "exit_code": 127,
+  "stdout": "",
+  "stderr": "/bin/sh: 1: ./cmd.sh: not found\n",
+  "elapsed": 0.001,
+  "timed_out": false,
+  "hash": "8b39b01ae1cabc3954a323d3bd5fef1a4827ed333c03caec9fea992ebd88f313",
+  "ts": "2026-11-09T11:12:18+08:00",
+  "ts_epoch": 1794193938.7978299,
+  "step": "S1",
+  "label": "",
+  "outputs": [],
+  "checks": [
+    {
+      "kind": "require",
+      "pattern": "NEEDLE",
+      "ok": false
+    }
+  ],
+  "check_failures": [
+    "--require 未命中: NEEDLE——目标路径激活的正证据缺失"
+  ],
+  "passed": false
+}

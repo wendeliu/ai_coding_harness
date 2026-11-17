@@ -1,0 +1,37 @@
+{
+  "version": 3,
+  "$schema": "harness-state-v1",
+  "task_objective": "test",
+  "status": "PLANNING",
+  "project_root": "/home/wende/.claude/skills/ai-coding-harness/template",
+  "authorized_scopes": [],
+  "baseline": {},
+  "task_tree": [],
+  "current_step": null,
+  "tried_directions": [],
+  "transitions": [
+    {
+      "from": "CREATED",
+      "to": "PLANNING",
+      "at": "2026-10-22T09:49:47.949311+00:00",
+      "context": {
+        "event": "init"
+      }
+    }
+  ],
+  "frozen": false,
+  "frozen_at": null,
+  "replan_count": 0,
+  "task_id": "TASK-20261022-174947",
+  "objective": "test",
+  "scopes": [],
+  "phase": "PLANNED",
+  "created_at": "2026-10-22T17:49:47+08:00",
+  "plan_approved": false,
+  "plan_sha256": null,
+  "approved_at": null,
+  "open_step": null,
+  "last_step": null,
+  "baseline_tag": "harness-baseline",
+  "updated_at": "2026-10-22T09:49:47.949302+00:00"
+}

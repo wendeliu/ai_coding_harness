@@ -1,0 +1,23 @@
+{
+  "command": "echo hello",
+  "exit_code": 0,
+  "stdout": "hello\n",
+  "stderr": "",
+  "elapsed": 0.002,
+  "timed_out": false,
+  "hash": "5ea121cb1830d44b2d38e349198ed4873255d40b09ba37edb1d88df73b42e93c",
+  "ts": "2026-11-09T11:12:33+08:00",
+  "ts_epoch": 1794193953.399489,
+  "step": "S1",
+  "label": "",
+  "outputs": [],
+  "checks": [],
+  "check_failures": [],
+  "passed": true,
+  "confirm_hash": "5506c3ad9cca2619916adfd3d607b4f6b20c4fd17b21e828c968bd6bc3552f71",
+  "phase": 2,
+  "committed": true,
+  "intent": "",
+  "_file": ".harness/evidence/S1/20261109T111233-5ea121cb.json",
+  "commit_ts": "2026-11-09T11:13:03+08:00"
+}

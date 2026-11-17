@@ -1,0 +1,25 @@
+{
+  "command": "echo hello",
+  "exit_code": 0,
+  "stdout": "hello\n",
+  "stderr": "",
+  "elapsed": 0.001,
+  "timed_out": false,
+  "hash": "9d59c83deb5c2cd42aed9eea556c2ed0a548826827668c3a5846e4d8973cf1bf",
+  "ts": "2026-11-09T11:12:33+08:00",
+  "ts_epoch": 1794193953.323307,
+  "step": "S1",
+  "label": "",
+  "outputs": [],
+  "checks": [
+    {
+      "kind": "require",
+      "pattern": "NEEDLE",
+      "ok": false
+    }
+  ],
+  "check_failures": [
+    "--require 未命中: NEEDLE——目标路径激活的正证据缺失"
+  ],
+  "passed": false
+}

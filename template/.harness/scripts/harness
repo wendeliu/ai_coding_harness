@@ -1,0 +1,2941 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ai-coding-harness v3 :: 单一 CLI 网关。
+
+设计约束（见 SKILL.md）：
+  · 项目文件的唯一写入通道是 `publish`（审核 -> 备份 -> 写入 -> manifest）。
+  · 人工授权（approve / confirm / adopt / abort / passwd）强制读写 /dev/tty，
+    并要求安装时由人设置的口令；非交互调用直接失败。
+  · step 完成时自动对账 + commit + 打 tag；每个 step 都可用 git 回溯。
+
+本文件只依赖 Python 标准库，且不 import 项目内任何模块。
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+VERSION = "3.1.0"
+HARNESS_DIR = ".harness"
+SCRATCH_DIR = ".harness-tmp"  # AI 起草区（项目根下无监管 tmp）；写工具放行，对账/提交忽略
+PLAN_FILE = "plan.md"
+MAX_PUBLISH_PAIRS = 10
+MAX_PUBLISH_BYTES = 2 * 1024 * 1024
+EVIDENCE_DIR = "evidence"  # .harness/evidence/<step>/<ts>/
+MAX_VERIFY_TIMEOUT = 600   # 单次验收命令最长 10 分钟
+MAX_EVIDENCE_BYTES = 2 * 1024 * 1024  # 单条证据输出上限
+GIT_TIMEOUT = 60           # 单次 git 操作最长 60 秒（防 GPG/ssh 提示挂死）
+SCRIPT_TIMEOUT = 300       # replan/validate/inspect 子脚本最长 5 分钟
+
+WRITE_EVENTS = ("publish", "adopt", "approve", "verify")
+
+# 状态机（v2.2 state_machine.py，两级：Task + Step）。
+# state_machine.py 在 .harness/（scripts 的上一级），import 失败时降级为无状态机
+# （不锁死硬约束闸门）。
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_HARNESS_ROOT = os.path.dirname(_THIS_DIR)
+for _p in (_THIS_DIR, _HARNESS_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+try:
+    from state_machine import (StateMachine, TaskStatus,
+                               StepStateMachine, StepStatus)
+    _HAVE_SM = True
+except Exception:
+    StateMachine = TaskStatus = StepStateMachine = StepStatus = None  # type: ignore
+    _HAVE_SM = False
+
+
+# --------------------------------------------------------------------------- #
+# 基础工具
+# --------------------------------------------------------------------------- #
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def now_epoch() -> float:
+    return time.time()
+
+
+def _sm_transition_task(root: Path, target: "TaskStatus", **ctx) -> None:
+    """通过状态机做 Task 级合法转换并记录历史。无状态机时直接置 status。
+    目标状态等于当前状态时 no-op（幂等，允许重复 step start）。"""
+    sp = state_path(root)
+    st = load_state(root)
+    if not _HAVE_SM:
+        st["status"] = getattr(target, "value", target)
+        save_state(root, st)
+        return
+    sm = StateMachine(str(sp))
+    sm.state.update({k: v for k, v in st.items() if k != "status"})
+    current = sm.state.get("status")
+    if current == target.value:
+        return  # 幂等：已在目标状态
+    try:
+        sm.transition(target, **ctx)
+    except ValueError as exc:
+        die("非法任务状态转换: %s" % exc)
+    merged = sm.state
+    merged["status"] = target.value
+    save_state(root, merged)
+
+
+def _sm_transition_step(root: Path, step_id: str, target: "StepStatus",
+                        **ctx) -> None:
+    """通过状态机做 Step 级合法转换。step 不存在于 task_tree 时自动建。"""
+    if not _HAVE_SM:
+        return
+    sp = state_path(root)
+    st = load_state(root)
+    sm = StateMachine(str(sp))
+    sm.state.update({k: v for k, v in st.items() if k != "status"})
+    if not any((s.get("step_id") or s.get("id")) == step_id
+               for s in sm.state.get("task_tree", [])):
+        sm.state.setdefault("task_tree", []).append({
+            "step_id": step_id, "id": step_id,
+            "title": (st.get("open_step") or {}).get("title", ""),
+            "status": StepStatus.PLANNED.value,
+            "transitions": [],
+        })
+    ssm = StepStateMachine(sm, step_id)
+    try:
+        ssm.transition(target, **ctx)
+    except ValueError as exc:
+        die("非法 step 状态转换: %s" % exc)
+    save_state(root, sm.state)
+
+
+def _task_status_for_phase(phase: str) -> "TaskStatus":
+    return {
+        "PLANNED": TaskStatus.PLANNING,
+        "APPROVED": TaskStatus.PENDING_AUTH,
+        "IN_PROGRESS": TaskStatus.IN_PROGRESS,
+    }.get(phase, TaskStatus.PLANNING)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json(path: Path, data: Any, mode: Optional[int] = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp.%d" % os.getpid())
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    if mode is not None:
+        os.chmod(str(tmp), mode)
+    os.replace(str(tmp), str(path))
+
+
+def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def iter_jsonl(path: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except Exception:
+        return out
+    return out
+
+
+def die(msg: str, code: int = 1) -> "None":
+    sys.stderr.write("harness: %s\n" % msg)
+    raise SystemExit(code)
+
+
+def ok(msg: str) -> None:
+    print(msg)
+
+
+def warn(msg: str) -> None:
+    sys.stderr.write("harness: [WARN] %s\n" % msg)
+
+
+# --------------------------------------------------------------------------- #
+# 项目根 / 路径
+# --------------------------------------------------------------------------- #
+def _looks_like_root(p: Path) -> bool:
+    return (p / HARNESS_DIR).is_dir() and (
+        (p / HARNESS_DIR / "state.json").is_file()
+        or (p / HARNESS_DIR / "scripts" / "harness").is_file()
+    )
+
+
+def find_root(start: Optional[Path] = None) -> Optional[Path]:
+    cands: List[Path] = []
+    if start is not None:
+        cands.append(Path(start))
+    else:
+        cands.append(Path(os.getcwd()))
+        # <root>/.harness/scripts/harness -> <root>
+        cands.append(Path(__file__).resolve().parent.parent.parent)
+    for c in cands:
+        try:
+            cur = c.resolve()
+        except Exception:
+            continue
+        for _ in range(16):
+            if _looks_like_root(cur):
+                return cur
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+    return None
+
+
+def require_root() -> Path:
+    root = find_root()
+    if root is None:
+        die("找不到 harness 项目（向上查找 .harness/state.json 失败）。")
+    return root
+
+
+def hdir(root: Path) -> Path:
+    return root / HARNESS_DIR
+
+
+def state_path(root: Path) -> Path:
+    return hdir(root) / "state.json"
+
+
+def manifest_path(root: Path) -> Path:
+    return hdir(root) / "manifest.jsonl"
+
+
+def worklog_path(root: Path) -> Path:
+    return hdir(root) / "worklog.jsonl"
+
+
+def allowlist_path(root: Path) -> Path:
+    return hdir(root) / "allowlist.json"
+
+
+def pending_dir(root: Path) -> Path:
+    return hdir(root) / "pending"
+
+
+def denials_path(root: Path) -> Path:
+    return hdir(root) / "denials.log"
+
+
+def branches_path(root: Path) -> Path:
+    return hdir(root) / "branches.json"
+
+
+DEFAULT_PROTECTED = ("master", "main")
+
+
+def load_branch_policy(root: Path) -> Dict[str, Any]:
+    data = read_json(branches_path(root), {})
+    if not isinstance(data, dict):
+        data = {}
+    prot = data.get("protected")
+    if not isinstance(prot, list) or not prot:
+        prot = list(DEFAULT_PROTECTED)
+    return {"version": data.get("version", 1),
+            "protected": [str(b) for b in prot]}
+
+
+def save_branch_policy(root: Path, pol: Dict[str, Any]) -> None:
+    write_json(branches_path(root), pol)
+
+
+def current_branch(root: Path) -> str:
+    p = git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    return (p.stdout or "").strip() if p.returncode == 0 else ""
+
+
+def remote_default_branch(root: Path) -> str:
+    p = git(root, "symbolic-ref", "-q", "--short",
+            "refs/remotes/origin/HEAD")
+    return (p.stdout or "").strip().split("/")[-1] if p.returncode == 0 else ""
+
+
+def is_protected_branch(root: Path, name: str) -> bool:
+    if not name or name == "HEAD":
+        return False
+    if name in load_branch_policy(root)["protected"]:
+        return True
+    # 兜底：origin/HEAD 指向的远端默认分支始终视为保护分支
+    return bool(remote_default_branch(root)) and \
+        name == remote_default_branch(root)
+
+
+def require_dev_branch(root: Path, st: Dict[str, Any]) -> str:
+    """任务执行期硬闸门：必须在任务开发分支上，保护分支一律拒绝。"""
+    cur = current_branch(root)
+    if not cur:
+        return cur
+    if is_protected_branch(root, cur):
+        die("当前在保护分支 %s：harness 任务只能在开发分支上执行。\n"
+            "  harness init 会自动创建 harness/<task_id> 开发分支；"
+            "或由用户手动 git checkout -b 后重试。\n"
+            "  保护分支只能通过人工 harness merge 合入。" % cur)
+    dev = st.get("dev_branch")
+    if dev and cur != dev:
+        die("当前分支 %s 与本任务的开发分支 %s 不一致；请切回后重试。"
+            % (cur, dev))
+    return cur
+
+
+def load_state(root: Path) -> Dict[str, Any]:
+    st = read_json(state_path(root), {})
+    return st if isinstance(st, dict) else {}
+
+
+def save_state(root: Path, st: Dict[str, Any]) -> None:
+    write_json(state_path(root), st)
+
+
+# --------------------------------------------------------------------------- #
+# git
+# --------------------------------------------------------------------------- #
+def git(root: Path, *args: str, check: bool = False,
+        text: bool = True) -> subprocess.CompletedProcess:
+    try:
+        proc = subprocess.run(["git"] + list(args), cwd=str(root),
+                              capture_output=True, text=text, timeout=GIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        die("git %s 超时（%d 秒）— 可能卡在 GPG/ssh 提示，请检查 git 配置。"
+            % (" ".join(args), GIT_TIMEOUT))
+    if check and proc.returncode != 0:
+        err = proc.stderr if text else proc.stderr.decode("utf-8", "replace")
+        die("git %s 失败: %s" % (" ".join(args), (err or "").strip()))
+    return proc
+
+
+def is_git_repo(root: Path) -> bool:
+    p = git(root, "rev-parse", "--show-toplevel")
+    return p.returncode == 0
+
+
+def git_has_head(root: Path) -> bool:
+    return git(root, "rev-parse", "--verify", "HEAD").returncode == 0
+
+
+def git_commit_all(root: Path, message: str) -> Tuple[bool, str]:
+    """提交当前全部变更；缺少身份时回退到 harness 身份。返回 (成功, 详情)。"""
+    add = git(root, "add", "-A")
+    if add.returncode != 0:
+        return False, (add.stderr or "").strip()
+    proc = git(root, "commit", "-m", message)
+    if proc.returncode == 0:
+        return True, (proc.stdout or "").strip()
+    err = (proc.stderr or "") + (proc.stdout or "")
+    if "Please tell me who you are" in err or "unable to auto-detect email" in err \
+            or "Author identity unknown" in err:
+        proc = git(root, "-c", "user.name=ai-coding-harness",
+                   "-c", "user.email=harness@localhost",
+                   "commit", "-m", message)
+        if proc.returncode == 0:
+            return True, (proc.stdout or "").strip()
+    return False, err.strip()
+
+
+def git_tag_epoch(root: Path, tag: str) -> Optional[float]:
+    p = git(root, "log", "-1", "--format=%ct", tag)
+    if p.returncode != 0:
+        return None
+    try:
+        return float((p.stdout or "").strip())
+    except Exception:
+        return None
+
+
+def git_tags_matching(root: Path, pattern: str) -> List[str]:
+    p = git(root, "tag", "--list", pattern, "--sort=-creatordate")
+    if p.returncode != 0:
+        return []
+    return [t.strip() for t in (p.stdout or "").splitlines() if t.strip()]
+
+
+# --------------------------------------------------------------------------- #
+# 口令 / 授权（stdin + 进程树校验 + 失败限流）
+# --------------------------------------------------------------------------- #
+# 不依赖 /dev/tty（低权限服务器可能无 pts）。主防线是口令本身：AI 不知道口令、
+# 读不到 0600 的 secret 文件。进程树校验是辅助防线（agent 可 setsid 绕过，但
+# 仍需口令）。失败限流防暴力破解。
+AGENT_BASENAME_PATTERNS = (
+    "codex", "claude", "aider", "continue", "cursor-agent",
+    "open-interpreter", "devin", "smol-developer",
+)
+
+
+def secret_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return Path(base) / "ai-coding-harness" / "secret.json"
+
+
+def _readline_hidden(prompt: str) -> str:
+    """从 stdin 读一行；若 stdin 是 tty，关闭回显。"""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    fd = sys.stdin.fileno()
+    old = None
+    if os.isatty(fd):
+        try:
+            import termios
+            old = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            new[3] &= ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        except Exception:
+            old = None
+    try:
+        line = sys.stdin.readline()
+    finally:
+        if old is not None:
+            try:
+                import termios
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except Exception:
+                pass
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+    return line.rstrip("\r\n")
+
+
+def _readline(prompt: str) -> str:
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    return sys.stdin.readline().rstrip("\r\n")
+
+
+def _proc_tree_has_agent() -> Optional[str]:
+    """向上遍历父进程链，若发现 agent 进程返回其 cmdline，否则 None。
+
+    匹配可执行文件 basename（避免误判含 .claude/ 路径的普通 shell）。
+    /proc 不可用时返回 None（不因校验失败而锁死）。"""
+    pid = os.getpid()
+    seen = set()
+    for _ in range(40):
+        if pid <= 1 or pid in seen:
+            return None
+        seen.add(pid)
+        try:
+            stat = Path("/proc/%d/stat" % pid).read_text()
+            rparen = stat.rfind(")")
+            fields = stat[rparen + 2:].split()
+            ppid = int(fields[1])
+            cmdline = Path("/proc/%d/cmdline" % pid).read_bytes() \
+                .replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except Exception:
+            return None
+        # 取第一个 token 作为可执行路径，匹配 basename
+        first = cmdline.split(None, 1)[0] if cmdline else ""
+        base = os.path.basename(first).lower()
+        for pat in AGENT_BASENAME_PATTERNS:
+            if base == pat or base.startswith(pat + "-") or base == pat + ".exe":
+                return cmdline
+        pid = ppid
+    return None
+
+
+def _lockout_path(root: Path) -> Path:
+    return hdir(root) / "lockout.json"
+
+
+def _check_lockout(root: Path) -> None:
+    data = read_json(_lockout_path(root), {})
+    if not isinstance(data, dict):
+        return
+    until = float(data.get("locked_until") or 0)
+    if until > now_epoch():
+        die("授权失败次数过多，已锁定 %d 秒，请稍后重试。"
+            % int(until - now_epoch()))
+
+
+def _record_auth_fail(root: Path) -> None:
+    path = _lockout_path(root)
+    data = read_json(path, {})
+    if not isinstance(data, dict):
+        data = {}
+    now = now_epoch()
+    if now - float(data.get("window_start") or 0) > 600:
+        data = {"window_start": now, "fails": 0, "locked_until": 0}
+    data["fails"] = int(data.get("fails") or 0) + 1
+    if data["fails"] >= 3:
+        data["locked_until"] = now + 60
+        data["fails"] = 0
+        data["locked_at"] = now_iso()
+    data["last_fail"] = now_iso()
+    write_json(path, data)
+
+
+def _record_auth_ok(root: Path) -> None:
+    path = _lockout_path(root)
+    if path.is_file():
+        write_json(path, {"window_start": now_epoch(), "fails": 0,
+                          "locked_until": 0, "last_ok": now_iso()})
+
+
+def _enforce_not_agent() -> None:
+    """拒绝从 agent 进程树内发起的授权调用（辅助防线，可被 setsid 绕过）。"""
+    if os.environ.get("HARNESS_TEST_BYPASS_AGENT_CHECK") == "1":
+        return  # 仅用于自动化测试；生产环境不应设置
+    hit = _proc_tree_has_agent()
+    if hit:
+        die("检测到授权调用来自 agent 进程树（%s），拒绝。\n"
+            "用户应在自己的终端（非 agent 子进程）运行 harness confirm/approve。"
+            % hit[:120])
+
+
+def _hash_passphrase(passphrase: str, salt_hex: str) -> str:
+    return hashlib.sha256(bytes.fromhex(salt_hex) +
+                          passphrase.encode("utf-8")).hexdigest()
+
+
+def ensure_passphrase(passphrase_file: Optional[str] = None,
+                      rotate: bool = False) -> None:
+    path = secret_path()
+    existing = read_json(path, None)
+    provided = None
+    if passphrase_file:
+        try:
+            provided = Path(passphrase_file).read_text(
+                encoding="utf-8").splitlines()[0]
+        except Exception as exc:
+            die("读取口令文件失败: %s" % exc)
+    if existing and not rotate:
+        if provided is not None:
+            salt = existing.get("salt", "")
+            if not hmac.compare_digest(_hash_passphrase(provided, salt),
+                                       existing.get("hash", "")):
+                die("提供的口令与已安装口令不一致；未做任何修改。")
+        ok("口令已存在，沿用现有口令。")
+        return
+    if provided is None:
+        first = _readline_hidden("设置 harness 授权口令（>=8 字符）: ")
+        if len(first) < 8:
+            die("口令太短（至少 8 字符）。")
+        second = _readline_hidden("再次输入口令: ")
+        if first != second:
+            die("两次输入不一致。")
+        provided = first
+    if len(provided) < 8:
+        die("口令太短（至少 8 字符）。")
+    import secrets as _secrets
+    salt = _secrets.token_hex(16)
+    rec = {
+        "algo": "sha256",
+        "salt": salt,
+        "hash": _hash_passphrase(provided, salt),
+        "created": now_iso(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(str(path.parent), 0o700)
+    except Exception:
+        pass
+    write_json(path, rec, mode=0o600)
+    ok("授权口令已写入 %s（不属于项目，AI 无法读取明文）。" % path)
+
+
+def verify_passphrase(prompt: str = "harness 授权口令: ") -> None:
+    _enforce_not_agent()
+    _check_lockout(require_root())
+    path = secret_path()
+    rec = read_json(path, None)
+    if not isinstance(rec, dict) or not rec.get("hash") or not rec.get("salt"):
+        die("尚未设置授权口令。请由用户在自己的终端运行 install.sh，"
+            "或删除 %s 后重跑安装。" % path)
+    root = require_root()
+    for attempt in range(3):
+        got = _readline_hidden(prompt if attempt == 0
+                               else "口令错误，重试（%d/3）: " % (attempt + 1))
+        if hmac.compare_digest(_hash_passphrase(got, rec["salt"]), rec["hash"]):
+            _record_auth_ok(root)
+            return
+        _record_auth_fail(root)
+    die("口令校验失败。")
+
+
+def confirm_input(question: str) -> bool:
+    sys.stderr.write(question + " [y/N]: ")
+    sys.stderr.flush()
+    ans = sys.stdin.readline().rstrip("\r\n").strip().lower()
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+    return ans in ("y", "yes")
+
+
+# --------------------------------------------------------------------------- #
+# 忽略规则 / 对账
+# --------------------------------------------------------------------------- #
+def load_ignore_patterns(root: Path) -> List[str]:
+    pats: List[str] = []
+    for p in (hdir(root) / ".harnessignore", root / ".harnessignore"):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pats.append(line)
+    return pats
+
+
+def is_ignored(rel: str, patterns: List[str]) -> bool:
+    rel = rel.replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    # 证据文件必须纳入对账（防篡改），不随 .harness/ 整体忽略
+    if rel.startswith(HARNESS_DIR + "/evidence/"):
+        return False
+    if rel == HARNESS_DIR or rel.startswith(HARNESS_DIR + "/"):
+        return True
+    if rel == ".codex" or rel.startswith(".codex/"):
+        return True
+    if rel == ".claude" or rel.startswith(".claude/"):
+        return True
+    if rel == ".git" or rel.startswith(".git/"):
+        return True
+    # AI 起草区硬编码忽略（不依赖 ignore 文件内容，升级路径上旧文件缺条目也不影响对账）
+    if rel == SCRATCH_DIR or rel.startswith(SCRATCH_DIR + "/"):
+        return True
+    if rel == ".harnessignore":
+        return True
+    for pat in patterns:
+        p = pat.replace("\\", "/")
+        dir_only = p.endswith("/")
+        p = p.rstrip("/")
+        if dir_only:
+            if rel == p or rel.startswith(p + "/"):
+                return True
+            if fnmatch.fnmatch(rel, p + "/*"):
+                return True
+            continue
+        if "/" not in p:
+            if fnmatch.fnmatch(os.path.basename(rel), p):
+                return True
+        if fnmatch.fnmatch(rel, p):
+            return True
+        if p.startswith("**/") and fnmatch.fnmatch(rel, p[3:]):
+            return True
+    return False
+
+
+def git_status_entries(root: Path) -> List[Tuple[str, str]]:
+    """返回 [(xy, path)]，path 相对项目根，已处理重命名/空格。"""
+    if not is_git_repo(root):
+        return []
+    proc = git(root, "-c", "core.quotepath=false", "status",
+               "--porcelain=v1", "-z", "--untracked-files=all", text=False)
+    if proc.returncode != 0:
+        return []
+    raw = (proc.stdout or b"").decode("utf-8", "replace")
+    parts = raw.split("\0")
+    out: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(parts):
+        rec = parts[i]
+        i += 1
+        if len(rec) < 4:
+            continue
+        xy = rec[:2]
+        path = rec[3:]
+        if xy[0] in ("R", "C"):
+            # 下一个记录是旧路径，丢弃
+            i += 1
+        out.append((xy, path))
+    return out
+
+
+def last_record_for(root: Path, rel: str) -> Optional[Dict[str, Any]]:
+    found = None
+    for rec in iter_jsonl(manifest_path(root)):
+        if rec.get("path") == rel:
+            found = rec
+    return found
+
+
+def _registered(root: Path, rel: str, xy: str) -> Tuple[bool, str]:
+    last = last_record_for(root, rel)
+    if "D" in xy:
+        if last and last.get("deleted") and last.get("event") in WRITE_EVENTS:
+            return True, ""
+        return False, "删除操作未经 adopt 登记"
+    cur = sha256_file(root / rel)
+    if last and last.get("event") in WRITE_EVENTS \
+            and last.get("hash_after") == cur and cur is not None:
+        return True, ""
+    if last:
+        return False, "上次发布后又被改动（manifest hash 不匹配）"
+    return False, "不在 manifest 中（未经过 publish/adopt）"
+
+
+def reconcile(root: Path) -> List[Tuple[str, str]]:
+    patterns = load_ignore_patterns(root)
+    bad: List[Tuple[str, str]] = []
+    for xy, rel in git_status_entries(root):
+        rel = rel.replace("\\", "/")
+        if is_ignored(rel, patterns):
+            continue
+        registered, reason = _registered(root, rel, xy)
+        if not registered:
+            bad.append((rel, reason))
+    return bad
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    root = require_root()
+    bad = reconcile(root)
+    if not bad:
+        if not args.quiet:
+            ok("工作区已对账：所有改动均已登记。")
+        return 0
+    if args.quiet:
+        for rel, reason in bad:
+            print("%s\t%s" % (rel, reason))
+    else:
+        print("存在未登记改动：")
+        for rel, reason in bad:
+            print("  - %s  (%s)" % (rel, reason))
+        print("\n处理：harness publish <path> --from .harness-tmp/<file>  或  "
+              "harness adopt --path <path> --reason \"...\"（需口令）")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
+# 审核
+# --------------------------------------------------------------------------- #
+DETERMINISTIC_SECRETS = [
+    ("OpenAI key", re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("private key block", re.compile(
+        r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+]
+
+_SECRET_CONTEXT = re.compile(
+    r"(?i)(secret|token|passw|credential|api[_-]?key|auth|private|access[_-]?key)")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+
+
+def _entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts: Dict[str, int] = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    import math
+    n = float(len(s))
+    return -sum((c / n) * math.log(c / n, 2) for c in counts.values())
+
+
+def scan_secrets(text: str) -> List[str]:
+    findings: List[str] = []
+    for name, rx in DETERMINISTIC_SECRETS:
+        for m in rx.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            findings.append("%s（第 %d 行）" % (name, line))
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for m in _TOKEN_RE.finditer(line):
+            tok = m.group(0)
+            if re.fullmatch(r"[0-9a-f]{32,}", tok):
+                continue  # 纯十六进制更像 hash，不当作密钥
+            if _entropy(tok) < 4.2:
+                continue
+            before = line[max(0, m.start() - 48):m.start()]
+            strong = _SECRET_CONTEXT.search(before) is not None
+            if "/" in tok and not strong:
+                continue  # 含 / 的长串更像文件路径，JSON 的 "key": "..." 会带冒号误触发
+            if not strong and "=" not in before and ":" not in before:
+                continue
+            findings.append("高熵可疑密钥（第 %d 行，已隐去值）" % lineno)
+    return findings
+
+
+def syntax_check(rel: str, data: bytes) -> Optional[str]:
+    ext = Path(rel).suffix.lower()
+    try:
+        text = data.decode("utf-8")
+    except Exception:
+        return None
+    try:
+        if ext == ".py":
+            compile(text, rel, "exec")
+        elif ext == ".json":
+            json.loads(text)
+        elif ext == ".jsonl":
+            for i, line in enumerate(text.splitlines(), 1):
+                if line.strip():
+                    json.loads(line)
+        elif ext == ".toml":
+            try:
+                import tomllib  # type: ignore
+                tomllib.loads(text)
+            except ImportError:
+                pass
+        elif ext in (".yaml", ".yml"):
+            try:
+                import yaml  # type: ignore
+                yaml.safe_load(text)
+            except ImportError:
+                pass
+        elif ext in (".sh", ".bash"):
+            tmp = tempfile.NamedTemporaryFile("wb", suffix=ext, delete=False)
+            try:
+                tmp.write(data)
+                tmp.close()
+                proc = subprocess.run(["bash", "-n", tmp.name],
+                                      capture_output=True, text=True)
+                if proc.returncode != 0:
+                    return (proc.stderr or "bash -n 失败").strip()
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+    except SyntaxError as exc:
+        return "%s: %s" % (type(exc).__name__, exc)
+    except Exception as exc:
+        return "%s: %s" % (type(exc).__name__, exc)
+    return None
+
+
+def _resolve_dest(root: Path, raw: str) -> Tuple[Path, str]:
+    p = Path(raw)
+    if not p.is_absolute():
+        p = root / p
+    parent = p.parent
+    try:
+        parent_real = parent.resolve()
+    except Exception:
+        parent_real = parent.absolute()
+    dest = parent_real / p.name
+    root_real = root.resolve()
+    try:
+        rel = dest.relative_to(root_real)
+    except ValueError:
+        die("拒绝：目标不在项目内: %s" % raw)
+    rel_s = str(rel).replace("\\", "/")
+    top = rel_s.split("/")[0]
+    if top in (".git", HARNESS_DIR, ".codex", ".claude", SCRATCH_DIR):
+        die("拒绝：%s 是受保护路径，不能通过 publish 写入（scratch 只能作为 --from 源，不能作为目标）。" % rel_s)
+    if dest.exists() and dest.is_symlink():
+        die("拒绝：目标 %s 是符号链接。" % rel_s)
+    if dest.is_dir():
+        die("拒绝：目标 %s 是目录。" % rel_s)
+    if not rel_s or rel_s.startswith(".."):
+        die("拒绝：非法目标路径 %s" % raw)
+    return dest, rel_s
+
+
+def _review(rel: str, data: bytes) -> Optional[str]:
+    if b"\0" in data:
+        return "二进制文件（含 NUL 字节）不允许通过 publish 写入"
+    text = data.decode("utf-8", "replace")
+    secrets = scan_secrets(text)
+    if secrets:
+        return "疑似密钥：" + "；".join(secrets[:6]) + \
+            "\n（确定性指纹一律拒绝；请移除后重试）"
+    syn = syntax_check(rel, data)
+    if syn:
+        return "语法检查失败：%s" % syn
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# init / approve / step
+# --------------------------------------------------------------------------- #
+PLAN_TEMPLATE = """# Task Plan — {task_id}
+
+## 目标
+{objective}
+
+## 授权范围
+{scopes}
+
+## 验收标准（每个 step 收尾前必须由 harness verify 执行并通过）
+- [ ] V1. <验收命令与通过条件，如 `pytest -q` exit=0>
+
+### 验收设计原则（防「空心通过」——跑了、exit=0，但通过是空的）
+- [ ] 产物隔离：验收用独立目录/独有文件名，不复用固定文件名；harness verify
+      `--out <glob>` 断言产物新于本次运行（防陈旧产物冒充新结果）。
+- [ ] 路径激活正证据：`--require <regex>` 断言输出命中目标路径的活跃计数
+      （如 `gpu_quads=[1-9]`、`shader_compile=[1-9]`）——证明目标路径真走了。
+- [ ] 回退即失败：`--forbid <regex>` 断言输出不含回退/降级信号
+      （如 `fallback|FORCE_SWRAST|swrast`）——回退日志是红灯，不是噪音。
+- [ ] 负对照/开关实验：对「启用 vs 禁用目标路径」各跑一次（不同 label），
+      `--must-differ <label>` 断言产物有差异——完全一致=疑似根本没切换。
+- [ ] 多信号交叉：md5/字节一致只是必要条件，须附 sha256+mtime+size+生成命令
+      +环境+库版本+活跃计数+耗时；对「完全一致」保持敌意，先排除假阳性路径。
+
+## 步骤
+- [ ] 1. 明确需求与验收标准
+- [ ] 2. 实现
+- [ ] 3. 验证（harness verify 执行验收命令，AI 自述不算）
+- [ ] 4. 总结
+
+## Revision History
+- {ts} plan 由 harness init 创建
+"""
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    root = find_root()
+    if root is None:
+        root = Path(os.getcwd()).resolve()
+    h = hdir(root)
+    for d in ("", "scripts", "scripts/git_hooks", "pending"):
+        (h / d).mkdir(parents=True, exist_ok=True)
+    # AI 起草区（项目根下无监管 tmp）；install.sh 也会建，此处兜底
+    (root / SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+    ensure_passphrase(getattr(args, "passphrase_file", None))
+
+    st = load_state(root)
+    if st and not args.force:
+        ok("已初始化，跳过（使用 --force 可重置计划）。")
+        return 0
+
+    task_id = args.task_id or ("TASK-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    objective = args.objective or "（未提供 objective）"
+    scopes = args.scopes or []
+    st = {
+        "version": 3,
+        # v2.2 兼容字段（state_machine.py / replan / validate / inspector 使用）
+        "$schema": "harness-state-v1",
+        "task_objective": objective,
+        "status": TaskStatus.CREATED.value,
+        "project_root": str(root),
+        "authorized_scopes": scopes,
+        "baseline": {},
+        "task_tree": [],
+        "current_step": None,
+        "tried_directions": [],
+        "transitions": [],
+        "frozen": False,
+        "frozen_at": None,
+        "replan_count": 0,
+        # v3 硬约束字段
+        "task_id": task_id,
+        "objective": objective,
+        "scopes": scopes,
+        "phase": "PLANNED",
+        "created_at": now_iso(),
+        "plan_approved": False,
+        "plan_sha256": None,
+        "approved_at": None,
+        "open_step": None,
+        "last_step": None,
+        "baseline_tag": "harness-baseline",
+        "base_branch": None,
+        "dev_branch": None,
+        "merge_request": None,
+    }
+    save_state(root, st)
+
+    if not allowlist_path(root).exists():
+        write_json(allowlist_path(root), {"version": 1, "entries": []})
+    for f in (manifest_path(root), worklog_path(root)):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.touch()
+
+    # Task 状态机：CREATED -> PLANNING
+    _sm_transition_task(root, TaskStatus.PLANNING, event="init")
+
+    ignore = h / ".harnessignore"
+    if not ignore.exists():
+        ignore.write_text(
+            "# harness reconcile 忽略规则（构建产物 / 生成物）\n"
+            "__pycache__/\n*.pyc\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n"
+            "node_modules/\ndist/\nbuild/\ntarget/\n.venv/\nvenv/\n*.log\n"
+            "# AI 起草区（is_ignored 已硬编码忽略，此处仅文档化）\n"
+            ".harness-tmp/\n",
+            encoding="utf-8")
+    gi = h / ".gitignore"
+    if not gi.exists():
+        gi.write_text("pending/\ndenials.log\n__pycache__/\n*.pyc\n"
+                      ".harness-tmp/\n",
+                      encoding="utf-8")
+
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "init",
+        "step": None, "task_id": task_id, "objective": objective,
+        "scopes": scopes, "files": [],
+    })
+
+    if is_git_repo(root):
+        gi_text = gi.read_text(encoding="utf-8") if gi.is_file() else ""
+        if "plan.md" not in gi_text:
+            gi_text = gi_text + "plan.md\n"
+        if SCRATCH_DIR + "/" not in gi_text:
+            gi_text = gi_text + SCRATCH_DIR + "/\n"
+        if gi_text != (gi.read_text(encoding="utf-8") if gi.is_file() else ""):
+            gi.write_text(gi_text, encoding="utf-8")
+        # .harnessignore 同样幂等补 scratch 条目（纵深防御；is_ignored 已硬编码）
+        ig_text = ignore.read_text(encoding="utf-8") if ignore.is_file() else ""
+        if SCRATCH_DIR + "/" not in ig_text:
+            ignore.write_text(ig_text + SCRATCH_DIR + "/\n", encoding="utf-8")
+        # 【项目根】.gitignore：.harness-tmp/ 在根目录，.harness/.gitignore 只作用域
+        # .harness/ 子树，必须写根 .gitignore 才能让 git add -A 跳过 scratch。
+        root_gi = root / ".gitignore"
+        rgi_text = root_gi.read_text(encoding="utf-8") if root_gi.is_file() else ""
+        if SCRATCH_DIR + "/" not in rgi_text:
+            root_gi.write_text(rgi_text + SCRATCH_DIR + "/\n", encoding="utf-8")
+        # 分支策略：一轮 plan 任务必须在独立开发分支上执行，保护分支
+        # 只能通过人工 harness merge 合入。
+        cur = current_branch(root)
+        if is_protected_branch(root, cur):
+            base_branch = cur
+            safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip("-")
+            dev_branch = "harness/%s" % (safe_id or "task")
+            if git(root, "checkout", "-b", dev_branch).returncode != 0:
+                die("无法创建开发分支 %s（可能已存在）；请手动处理后重试。"
+                    % dev_branch)
+            ok("已创建并切换到开发分支 %s（保护分支 %s 仅可经人工 merge 合入）"
+               % (dev_branch, base_branch))
+        else:
+            base_branch = next(
+                (b for b in load_branch_policy(root)["protected"]
+                 if git(root, "rev-parse", "--verify", b).returncode == 0),
+                None)
+            dev_branch = cur
+        st = load_state(root)  # 状态机转换后重载，避免覆盖 status/transitions
+        st["base_branch"] = base_branch
+        st["dev_branch"] = dev_branch
+        save_state(root, st)
+        git_commit_all(root, "harness: init task %s" % task_id)
+        if git(root, "rev-parse", "--verify", "harness-baseline").returncode != 0:
+            git(root, "tag", "harness-baseline")
+        else:
+            git(root, "tag", "-f", "harness-baseline")
+
+    ok("已初始化 task=%s" % task_id)
+    ok("下一步：在 .harness-tmp/ 起草 plan，然后 publish plan.md --from .harness-tmp/plan.md；"
+       "再由用户运行 harness approve")
+    return 0
+
+
+def _append_plan_revision(root: Path, line: str) -> None:
+    plan = root / PLAN_FILE
+    text = plan.read_text(encoding="utf-8")
+    if "## Revision History" not in text:
+        if not text.endswith("\n"):
+            text += "\n"
+        text += "\n## Revision History\n"
+    if not text.endswith("\n"):
+        text += "\n"
+    text += "- %s\n" % line
+    plan.write_text(text, encoding="utf-8")
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    root = require_root()
+    st = load_state(root)
+    if not st:
+        die("未初始化，先运行 harness init。")
+    plan = root / PLAN_FILE
+    if not plan.is_file():
+        die("缺少 %s" % PLAN_FILE)
+    if not plan.read_text(encoding="utf-8").strip():
+        die("%s 为空。" % PLAN_FILE)
+
+    verify_passphrase()
+    require_dev_branch(root, st)
+
+    bad = [(r, why) for r, why in reconcile(root) if r != PLAN_FILE]
+    if bad:
+        die("存在未登记改动，先 publish/adopt 后再签字：\n" +
+            "\n".join("  - %s (%s)" % (r, why) for r, why in bad))
+
+    _append_plan_revision(root, "%s APPROVED by user" % now_iso())
+    digest = sha256_file(plan)
+    st.update({
+        "phase": "APPROVED",
+        "plan_approved": True,
+        "plan_sha256": digest,
+        "approved_at": now_iso(),
+        "user_authorization": {
+            "approved_at": now_iso(),
+            "approved_by": os.environ.get("USER") or os.environ.get("LOGNAME") or "user",
+            "plan_sha256": digest,
+        },
+    })
+    save_state(root, st)
+    append_jsonl(manifest_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "approve",
+        "path": PLAN_FILE, "hash_before": None, "hash_after": digest,
+        "bytes": plan.stat().st_size, "source": None,
+        "review": {"syntax": "ok", "secret": "ok"},
+    })
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "approve",
+        "step": None, "message": "计划已签字", "files": [PLAN_FILE],
+    })
+
+    # Task 状态机：签字后进入 PENDING_AUTH（等待执行）。
+    # 边界情况（在途改 plan 后重新签字）：replan/adopt 改写了已批准计划，但任务
+    # 仍处于执行态（IN_PROGRESS）。此时 IN_PROGRESS -> PENDING_AUTH 非法；先退回
+    # PLANNING 再进 PENDING_AUTH，与 publish plan.md 的 replan_in_flight 路径保持一致。
+    if st.get("status") == TaskStatus.IN_PROGRESS.value:
+        _sm_transition_task(root, TaskStatus.PLANNING, event="approve_in_flight")
+    _sm_transition_task(root, TaskStatus.PENDING_AUTH, event="approve")
+
+    committed, detail = (False, "not a git repo")
+    if is_git_repo(root):
+        committed, detail = git_commit_all(root, "harness: plan approved")
+        if committed:
+            if git(root, "rev-parse", "--verify", "harness-baseline").returncode != 0:
+                git(root, "tag", "harness-baseline")
+            else:
+                git(root, "tag", "-f", "harness-baseline")
+    if committed:
+        ok("计划已签字并固化：%s" % ("harness-baseline"))
+    else:
+        ok("计划已签字（git 提交失败，未打 baseline：%s）" % detail.strip()[:200])
+    ok("下一步：harness step start <id> --title \"...\"")
+    return 0
+
+
+def cmd_step_start(args: argparse.Namespace) -> int:
+    root = require_root()
+    st = load_state(root)
+    if not st:
+        die("未初始化。")
+    if st.get("open_step"):
+        die("已有未完成的 step: %s" % st["open_step"].get("id"))
+    plan = root / PLAN_FILE
+    if not st.get("plan_approved") or not plan.is_file() \
+            or sha256_file(plan) != st.get("plan_sha256"):
+        die("计划未批准或批准后已被修改；请用户重新运行 harness approve。")
+    require_dev_branch(root, st)
+    sid = str(args.step)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", sid):
+        die("step id 只允许字母/数字/._-（<=32）")
+    st["open_step"] = {
+        "id": sid, "title": args.title or "",
+        "started_at": now_iso(), "start_epoch": now_epoch(),
+    }
+    st["phase"] = "IN_PROGRESS"
+    st["current_step"] = sid
+    save_state(root, st)
+    # Task: PENDING_AUTH -> IN_PROGRESS；Step: PLANNED -> CHECKPOINTING -> EXECUTING
+    _sm_transition_task(root, TaskStatus.IN_PROGRESS, event="step_start",
+                         step=sid)
+    _sm_transition_step(root, sid, StepStatus.CHECKPOINTING,
+                        event="step_start")
+    _sm_transition_step(root, sid, StepStatus.EXECUTING, event="step_start")
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "step_start",
+        "step": sid, "title": args.title or "", "files": [],
+    })
+    ok("step %s 已开始：%s" % (sid, args.title or "(no title)"))
+    return 0
+
+
+def _slug(text: str, limit: int = 20) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return (s[:limit] or "step").strip("-")
+
+
+def cmd_step_done(args: argparse.Namespace) -> int:
+    root = require_root()
+    st = load_state(root)
+    if not st:
+        die("未初始化。")
+    open_step = st.get("open_step") or {}
+    if not open_step:
+        die("没有进行中的 step。")
+    require_dev_branch(root, st)
+    sid = str(args.step)
+    if str(open_step.get("id")) != sid:
+        die("参数 step=%s 与进行中的 step=%s 不一致。" % (sid, open_step.get("id")))
+    if not args.message.strip():
+        die("必须用 -m 说明「做了什么/为什么」。")
+
+    bad = reconcile(root)
+    if bad:
+        die("存在未登记改动，拒绝收尾：\n" +
+            "\n".join("  - %s (%s)" % (r, why) for r, why in bad))
+
+    # 防造假验收：step done 强制要求该 step 有 harness 亲自执行并通过的证据。
+    # AI 自述的"测试通过"不算。--no-verify 需 --reason 且记入 worklog（可审计）。
+    if not args.no_verify:
+        passed, why = _step_has_passing_evidence(root, sid)
+        if not passed:
+            die("拒绝收尾：该 step 无通过的验收证据。\n  %s\n"
+                "AI 自述的验收结果不算。请运行：\n"
+                "  python .harness/scripts/harness verify --step %s -- <验收命令>\n"
+                "（验收命令由 harness 亲自执行并固化证据）\n"
+                "若该 step 确实无需验收（如纯规划），用 --no-verify --reason \"...\"。"
+                % (why, sid))
+        # phase-2 闸门：必须已二次提交（verify --commit --token），且 token 要
+        # 与提交时绑定的确认 token 一致。防"phase-1 后直接 step done 跳过复核"。
+        committed = _step_committed_evidence(root, sid)
+        if committed is None:
+            die("拒绝收尾：该 step 只有 phase-1 暂存证据，尚未二次提交。\n"
+                "  请先复核验证路径的覆盖层级/对象，再正式入库：\n"
+                "    harness verify --step %s --commit --token <上次打印的 token> \\\n"
+                "      --intent \"覆盖层级=...; 交付对象=...; 与用户路径同一对象\"\n"
+                "  缺失 --token 拒绝（防止 AI 自述跳过验证路径复核）。" % sid)
+        if args.token and _token_hash(args.token) != committed.get("confirm_hash"):
+            die("拒绝收尾：--token 与该 step 的确认 token 不匹配，无法收尾。")
+    elif not (args.reason or "").strip():
+        die("--no-verify 必须用 --reason 说明为何该 step 免验收（可审计）。")
+
+    files = [rec.get("path") for rec in iter_jsonl(manifest_path(root))
+             if str(rec.get("step")) == sid
+             and rec.get("event") in WRITE_EVENTS and rec.get("path")]
+    message = args.message.strip()
+    verify_summary = ""
+    if args.no_verify:
+        verify_summary = " [免验收: %s]" % args.reason.strip()
+    else:
+        _, vwhy = _step_has_passing_evidence(root, sid)
+        verify_summary = " [验收%s]" % vwhy
+    st.update({
+        "open_step": None, "last_step": sid, "phase": "IN_PROGRESS",
+        "last_step_done_at": now_iso(), "current_step": None,
+    })
+    save_state(root, st)
+    # Step: EXECUTING -> COMPLIANCE_REVIEW -> COMMITTING -> VERIFYING -> COMPLETED
+    _sm_transition_step(root, sid, StepStatus.COMPLIANCE_REVIEW,
+                         event="step_done")
+    _sm_transition_step(root, sid, StepStatus.COMMITTING, event="step_done")
+    _sm_transition_step(root, sid, StepStatus.VERIFYING, event="step_done")
+    _sm_transition_step(root, sid, StepStatus.COMPLETED, event="step_done")
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "step_done",
+        "step": sid, "title": open_step.get("title", ""),
+        "message": message + verify_summary, "files": files,
+        "verified": not args.no_verify,
+    })
+
+    tag = None
+    if not is_git_repo(root):
+        ok("step %s 已完成（非 git 仓库，跳过 commit/tag）。" % sid)
+        return 0
+    committed, detail = git_commit_all(
+        root, "harness(step %s): %s" % (sid, message))
+    if not committed:
+        die("git commit 失败：%s" % detail[:400])
+    base = "harness-s%s-%s" % (sid, _slug(message or open_step.get("title", "")))
+    tag = base
+    n = 2
+    while git(root, "rev-parse", "--verify", "refs/tags/" + tag).returncode == 0:
+        tag = "%s-%d" % (base, n)
+        n += 1
+    git(root, "tag", tag, check=True)
+    ok("step %s 已收尾：commit + tag %s（%d 个已登记文件）"
+       % (sid, tag, len(files)))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# publish
+# --------------------------------------------------------------------------- #
+def _atomic_write(dest: Path, data: bytes) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(dest.parent),
+                               prefix=".harness-tmp-", suffix=dest.suffix)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, str(dest))
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    root = require_root()
+    st = load_state(root)
+    if not st:
+        die("未初始化。")
+    if len(args.targets) != len(args.froms):
+        die("目标与 --from 必须成对且数量一致（%d vs %d）。"
+            % (len(args.targets), len(args.froms)))
+    if len(args.targets) > MAX_PUBLISH_PAIRS:
+        die("单次 publish 最多 %d 个文件（批量阈值），请拆分以保留审计粒度。"
+            % MAX_PUBLISH_PAIRS)
+    require_dev_branch(root, st)
+
+    open_step = st.get("open_step") or {}
+    plan = root / PLAN_FILE
+    plan_ok = bool(st.get("plan_approved")) and plan.is_file() \
+        and sha256_file(plan) == st.get("plan_sha256")
+
+    pairs: List[Tuple[Path, str, bytes, str]] = []
+    for raw_dest, raw_src in zip(args.targets, args.froms):
+        dest, rel = _resolve_dest(root, raw_dest)
+        src = Path(raw_src)
+        try:
+            src_real = src.resolve()
+        except Exception:
+            die("源文件不存在：%s" % raw_src)
+        if not src_real.is_file():
+            die("源文件不存在或不是普通文件：%s" % raw_src)
+        try:
+            src_rel = src_real.relative_to(root.resolve())
+            src_rel_s = str(src_rel).replace("\\", "/")
+            # 项目内源：只允许 .harness-tmp/ 下（起草区）；其余项目内路径拒绝
+            if not (src_rel_s == SCRATCH_DIR
+                    or src_rel_s.startswith(SCRATCH_DIR + "/")):
+                die("拒绝：源文件位于项目内受保护路径（%s）；"
+                    "AI 必须在 .harness-tmp/ 起草后再 publish。" % raw_src)
+        except ValueError:
+            pass  # 源在项目外（如 /tmp 残留或绝对路径），仍允许（向后兼容）
+        data = src_real.read_bytes()
+        if len(data) > MAX_PUBLISH_BYTES:
+            die("拒绝：%s 超过 %d 字节；大文件请用 git，不要走 publish。"
+                % (rel, MAX_PUBLISH_BYTES))
+        if not plan_ok and rel != PLAN_FILE:
+            die("计划未批准（或批准后已修改），只能 publish plan.md。"
+                "请用户先运行 harness approve。")
+        if rel != PLAN_FILE and not open_step:
+            die("没有进行中的 step；先运行 harness step start <id> --title \"...\"。")
+        problem = _review(rel, data)
+        if problem:
+            die("审核未通过（%s）：\n%s" % (rel, problem))
+        pairs.append((dest, rel, data, str(src_real)))
+
+    bad = reconcile(root)
+    if bad:
+        die("publish 前对账失败，存在未登记改动：\n" +
+            "\n".join("  - %s (%s)" % (r, why) for r, why in bad))
+
+    step_id = open_step.get("id") if open_step else None
+    for dest, rel, data, src_real in pairs:
+        before = sha256_file(dest)
+        _atomic_write(dest, data)
+        after = sha256_file(dest)
+        append_jsonl(manifest_path(root), {
+            "ts": now_iso(), "ts_epoch": now_epoch(), "event": "publish",
+            "path": rel, "step": step_id,
+            "hash_before": before, "hash_after": after,
+            "bytes": len(data), "source": src_real,
+            "review": {"syntax": "ok", "secret": "ok"},
+            "note": args.note or "",
+        })
+        if rel == PLAN_FILE:
+            st["plan_approved"] = False
+            st["plan_sha256"] = None
+            st["phase"] = "PLANNED"
+        ok("已发布 %s（%d bytes）" % (rel, len(data)))
+
+    save_state(root, st)
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "publish",
+        "step": step_id, "message": args.note or "",
+        "files": [rel for _, rel, _, _ in pairs],
+    })
+    if any(rel == PLAN_FILE for _, rel, _, _ in pairs):
+        ok("plan.md 已更新：原批准已失效，请用户重新 harness approve。")
+        # 在途改 plan：若任务已在执行中，退回 PLANNING 以便重新签字。
+        # 转换表允许 IN_PROGRESS -> PLANNING；其他状态（PLANNING/PENDING_AUTH）保持不变。
+        cur_status = (st.get("status") or TaskStatus.PLANNING.value)
+        if cur_status == TaskStatus.IN_PROGRESS.value:
+            _sm_transition_task(root, TaskStatus.PLANNING, event="replan_in_flight")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# confirm / adopt
+# --------------------------------------------------------------------------- #
+def cmd_confirm(args: argparse.Namespace) -> int:
+    root = require_root()
+    tid = args.ticket
+    if not re.fullmatch(r"tkt-[A-Za-z0-9._-]{1,64}", tid):
+        die("非法授权票 id。")
+    path = pending_dir(root) / (tid + ".json")
+    rec = read_json(path, None)
+    if not isinstance(rec, dict):
+        die("授权票不存在或已处理：%s" % tid)
+    if float(rec.get("expires") or 0) < time.time():
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        die("授权票已过期：%s" % tid)
+
+    verify_passphrase()
+
+    print("授权票 %s" % tid)
+    print("  类型: %s" % rec.get("kind"))
+    print("  原因: %s" % rec.get("reason"))
+    if rec.get("segment"):
+        print("  命令段: %s" % json.dumps(rec.get("segment"), ensure_ascii=False))
+    if rec.get("command"):
+        print("  完整命令: %s" % rec.get("command"))
+
+    mode = args.mode
+    if mode == "deny":
+        _drop_ticket(path)
+        _log_authorization(root, "deny", rec, None)
+        ok("已拒绝并删除授权票。")
+        return 0
+    if not mode:
+        ans = _readline(
+            "选择 [o]仅一次 / [a]总是放行此命令 / [p]永久放行该程序 / [d]拒绝: "
+        ).strip().lower()
+        mode = {"o": "once", "a": "always", "p": "program", "d": "deny"}.get(ans, "")
+    if mode not in ("once", "always", "program"):
+        die("未选择有效选项，授权票保留。")
+
+    segment = rec.get("segment")
+    if not isinstance(segment, list) or not segment:
+        die("授权票缺少命令段信息，无法生成许可。")
+    argv = [str(x) for x in segment]
+    entry: Dict[str, Any] = {"created": now_iso(), "ticket": tid}
+    if mode == "program":
+        prog = shutil.which(argv[0]) or argv[0]
+        entry.update({"type": "bin", "path": os.path.realpath(prog)})
+        print("  ⚠ 永久放行程序 %s 会削弱 publish 网关（该程序可写项目）。"
+              % entry["path"])
+    else:
+        entry.update({"type": "exact", "argv": argv})
+        if mode == "once":
+            entry["one_time"] = True
+            entry["expires"] = time.time() + 600
+
+    data = read_json(allowlist_path(root), {"version": 1, "entries": []})
+    if not isinstance(data, dict):
+        data = {"version": 1, "entries": []}
+    entries = data.setdefault("entries", [])
+    entries.append(entry)
+    write_json(allowlist_path(root), data)
+
+    _drop_ticket(path)
+    _log_authorization(root, mode, rec, entry)
+    ok("已写入许可（%s）。请重试刚才的操作。" % mode)
+    return 0
+
+
+def _drop_ticket(path: Path) -> None:
+    try:
+        path.unlink()
+    except Exception:
+        pass
+
+
+def _log_authorization(root: Path, mode: str, rec: Dict[str, Any],
+                       entry: Optional[Dict[str, Any]]) -> None:
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "confirm",
+        "step": (load_state(root).get("open_step") or {}).get("id"),
+        "message": "ticket=%s mode=%s" % (rec.get("id"), mode),
+        "files": [], "entry": entry,
+    })
+
+
+# --------------------------------------------------------------------------- #
+# branch / complete / merge：分支策略与人工合入
+# --------------------------------------------------------------------------- #
+def cmd_branch(args: argparse.Namespace) -> int:
+    root = require_root()
+    pol = load_branch_policy(root)
+    cur = current_branch(root)
+    if not (args.add or args.remove):
+        print("当前分支: %s" % (cur or "（非 git 仓库）"))
+        print("保护分支（仅可经人工 harness merge 合入）:")
+        for b in pol["protected"]:
+            mark = " *" if b == cur else ""
+            print("  - %s%s" % (b, mark))
+        print("变更保护分支：harness branch --add <name> / --remove <name>"
+              "（需授权口令）")
+        return 0
+
+    verify_passphrase()
+    changed: List[str] = []
+    for name in (args.add or []):
+        if not re.fullmatch(r"[A-Za-z0-9._/-]{1,64}", name):
+            die("非法分支名：%s" % name)
+        if name in pol["protected"]:
+            warn("已是保护分支：%s" % name)
+            continue
+        pol["protected"].append(name)
+        changed.append("add %s" % name)
+    for name in (args.remove or []):
+        if name not in pol["protected"]:
+            warn("不是保护分支：%s" % name)
+            continue
+        if len(pol["protected"]) <= 1:
+            die("至少保留一个保护分支。")
+        pol["protected"].remove(name)
+        changed.append("remove %s" % name)
+    if not changed:
+        return 0
+    save_branch_policy(root, pol)
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "branch_policy",
+        "step": None, "message": "; ".join(changed), "files": ["branches.json"],
+    })
+    ok("保护分支已更新：%s" % "; ".join(changed))
+    return 0
+
+
+def cmd_complete(args: argparse.Namespace) -> int:
+    root = require_root()
+    st = load_state(root)
+    if not st:
+        die("未初始化。")
+    if st.get("open_step"):
+        die("仍有未完成的 step: %s；先 step done。" % st["open_step"].get("id"))
+    if not st.get("last_step"):
+        die("尚无已完成的 step，不能 complete。")
+    dev = require_dev_branch(root, st)
+    bad = reconcile(root)
+    if bad:
+        die("存在未登记改动，拒绝结项：\n" +
+            "\n".join("  - %s (%s)" % (r, why) for r, why in bad))
+    status = st.get("status")
+    if status == TaskStatus.COMPLETED.value:
+        die("任务已完成，勿重复 complete。")
+    if status != TaskStatus.IN_PROGRESS.value:
+        die("当前状态 %s 不允许 complete（需 IN_PROGRESS）。" % status)
+
+    token = None
+    target = st.get("base_branch") or ""
+    if not target or not is_protected_branch(root, target):
+        prot = load_branch_policy(root)["protected"]
+        target = next((b for b in prot
+                       if git(root, "rev-parse", "--verify", b).returncode == 0
+                       and b != dev),
+                      prot[0] if prot else "")
+    st["merge_request"] = {
+        "created": now_iso(),
+        "dev": dev, "target": target, "status": "pending",
+    }
+    st["phase"] = "COMPLETE"
+    save_state(root, st)
+    # Task: IN_PROGRESS -> SUMMARIZING -> COMPLETED
+    _sm_transition_task(root, TaskStatus.SUMMARIZING, event="complete")
+    _sm_transition_task(root, TaskStatus.COMPLETED, event="complete")
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "complete",
+        "step": st.get("last_step"),
+        "message": "plan 全部完成，待人工签发 merge token（%s -> %s）"
+                   % (dev, target),
+        "files": [],
+    })
+    ok("计划已结项（%s -> %s 待合入）。" % (dev, target))
+    print("\n请用户【在自己的终端】运行以下命令（输授权口令）签发一次性 merge token：")
+    print("  python .harness/scripts/harness merge")
+    print("拿到 token 后：交给 AI 执行 `harness merge --token <token>` 合入，"
+          "或用户自行运行同一命令。")
+    return 0
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    root = require_root()
+    st = load_state(root)
+    if not st:
+        die("未初始化。")
+    mr = st.get("merge_request")
+    if not isinstance(mr, dict) or mr.get("status") != "pending":
+        die("没有待处理的 merge 请求；先在任务完成后运行 harness complete。")
+    dev = str(mr.get("dev") or "")
+    target = str(mr.get("target") or "")
+
+    if not args.token:
+        # 签发模式：仅人工（口令 + agent 进程树检测）。生成一次性 merge
+        # token，交给 AI 执行合入，或用户自行执行。
+        verify_passphrase()
+        if mr.get("token_sha256") and float(mr.get("expires") or 0) > time.time():
+            # 重新签发直接覆盖：旧 token（未用掉的）立即作废，防止 token
+            # 丢失后卡死整个流程。签发本身需人工口令，覆盖是安全的。
+            warn("覆盖未过期的旧 merge token（原 %s 过期，立即作废）。"
+                 % datetime.fromtimestamp(float(mr["expires"]))
+                 .strftime("%m-%d %H:%M"))
+        token = secrets.token_hex(16)
+        mr.update({"token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                   "issued_at": now_iso(),
+                   "expires": time.time() + 24 * 3600})
+        save_state(root, st)
+        append_jsonl(worklog_path(root), {
+            "ts": now_iso(), "ts_epoch": now_epoch(), "event": "merge_issue",
+            "step": st.get("last_step"),
+            "message": "人工签发 merge token（%s -> %s，24h 一次性）"
+                       % (dev, target), "files": [],
+        })
+        ok("merge token 已签发（一次性，24h 内有效）：")
+        print("  %s" % token)
+        print("执行合入：python .harness/scripts/harness merge --token %s"
+              % token)
+        print("（可交给 AI 执行，或用户自行运行；token 丢失可重新签发，"
+              "旧 token 随即作废。）")
+        return 0
+
+    # 执行模式：token 即授权（一次性、限时），无需口令。
+    if float(mr.get("expires") or 0) < time.time():
+        die("merge token 已过期；请用户重新运行 harness merge 签发。")
+    tok_hash = hashlib.sha256(args.token.encode()).hexdigest()
+    if not hmac.compare_digest(tok_hash, str(mr.get("token_sha256"))):
+        die("token 不匹配，拒绝合入。")
+    cur = current_branch(root)
+    if cur != dev:
+        die("当前分支 %s，请先切回开发分支 %s 再合入。" % (cur, dev))
+    if not target or not is_protected_branch(root, target):
+        die("目标分支 %s 不是保护分支，拒绝合入。" % target)
+    # complete/签发写下的状态变更先落在 dev 分支，避免脏树阻塞 checkout
+    # （无变更时为 no-op）。
+    git_commit_all(root, "harness: merge 前状态快照")
+
+    co = git(root, "checkout", target)
+    if co.returncode != 0:
+        die("git checkout %s 失败：%s" % (target, (co.stderr or "").strip()))
+    mg = git(root, "merge", "--no-ff", dev,
+             "-m", "harness: merge task %s (%s -> %s)"
+             % (st.get("task_id", "?"), dev, target))
+    if mg.returncode != 0:
+        die("git merge 失败（已停留在 %s）：%s"
+            % (target, ((mg.stdout or "") + (mg.stderr or "")).strip()[:400]))
+    mr.update({"status": "merged", "merged_at": now_iso()})
+    save_state(root, st)
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "merge",
+        "step": st.get("last_step"),
+        "message": "token 授权合入 %s -> %s" % (dev, target), "files": [],
+    })
+    ok("已合入 %s -> %s（--no-ff）。开发分支 %s 保留供审计。"
+       % (dev, target, dev))
+    return 0
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    root = require_root()
+    if not args.reason.strip():
+        die("必须用 --reason 说明为什么这些改动绕过 publish。")
+    verify_passphrase()
+
+    bad = reconcile(root)
+    if not bad:
+        ok("没有未登记改动。")
+        return 0
+    targets = set(args.path or [])
+    selected = [(r, why) for r, why in bad
+                if args.all or not targets or r in targets]
+    if not selected:
+        die("指定的路径不在未登记列表中。未登记：%s"
+            % ", ".join(r for r, _ in bad))
+    for rel, _why in selected:
+        p = root / rel
+        exists = p.is_file()
+        digest = sha256_file(p) if exists else None
+        append_jsonl(manifest_path(root), {
+            "ts": now_iso(), "ts_epoch": now_epoch(), "event": "adopt",
+            "path": rel, "step": (load_state(root).get("open_step") or {}).get("id"),
+            "hash_before": None, "hash_after": digest,
+            "deleted": not exists, "reason": args.reason.strip(),
+        })
+        ok("已登记 %s%s" % (rel, "" if exists else "（删除）"))
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "adopt",
+        "step": (load_state(root).get("open_step") or {}).get("id"),
+        "message": args.reason.strip(), "files": [r for r, _ in selected],
+    })
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# 验收证据（防 AI 造假 + 防空心通过）
+# --------------------------------------------------------------------------- #
+# 威胁一（造假）：AI 声称"测试通过"但实际没跑，或跑了个 gamed 命令。
+#   对策：验收命令由 harness 亲自执行，捕获 stdout/stderr/exit/耗时，算 hash
+#   写入 .harness/evidence/。step done 强制要求该 step 有通过证据。
+# 威胁二（空心通过）：命令真跑了、exit=0，但通过是空的——
+#   (a) 陈旧产物冒充新结果（没删旧文件，上次残留被判成这次的产出）；
+#   (b) 静默回退（目标路径根本没走，fallback 干了活）；
+#   (c) "一致"当强证据（两条路径都回退到同一实现，比对当然一致——
+#       一致性恰恰可能是"根本没切换"的信号）。
+#   对策（verify 的四道硬断言，任一不过即 FAIL，fail-closed）：
+#   --out GLOB       声明产物：harness 运行前后快照 sha256/mtime，产物必须
+#                    新于本次运行（新建/mtime 更新/内容变化其一），否则失败。
+#   --require REGEX  路径激活正证据：输出必须命中（如 gpu_quads=[1-9]）。
+#   --forbid REGEX   回退红线：输出不得命中（如 fallback|FORCE_SWRAST）。
+#   --must-differ L  负对照：产物必须与同 step 内 label=L 的通过证据有差异；
+#                    完全一致 = 疑似没切换，判失败。
+# 另有证据新鲜度：step 内最后一次 publish/adopt 之后必须重新验收，
+# 改了代码拿旧证据收尾一律拒绝。
+# AI 无法伪造：(1) 命令由 harness 子进程跑；(2) 证据由 harness 写入 .harness/
+# （写工具对 .harness 一律 deny）；(3) step done 校验证据新鲜且通过；
+# (4) 证据 hash 入 manifest，篡改即对账失败。
+
+def evidence_root(root: Path) -> Path:
+    return hdir(root) / EVIDENCE_DIR
+
+
+def evidence_step_dir(root: Path, step_id: str) -> Path:
+    return evidence_root(root) / step_id
+
+
+def _sanitize_step_id(sid: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "-", sid)[:48] or "step"
+
+
+def _validate_out_patterns(patterns: Iterable[str]) -> List[str]:
+    """--out 只接受项目内相对路径/glob，拒绝绝对路径与 .. 逃逸。"""
+    pats = []
+    for p in patterns:
+        p = (p or "").strip().replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        if not p or p.startswith("/") or p == ".." or p.startswith("../") \
+                or "/../" in p:
+            die("--out 必须是项目内相对路径/glob（拒绝绝对路径与 .. 逃逸）: %r"
+                % p)
+        pats.append(p)
+    return pats
+
+
+def _snapshot_outputs(root: Path, patterns: List[str]) -> Dict[str, dict]:
+    """对声明的产物取指纹快照 {rel: {sha256,size,mtime}}。"""
+    out: Dict[str, dict] = {}
+    for pat in patterns:
+        try:
+            matches = sorted(root.glob(pat))
+        except (ValueError, RuntimeError) as exc:
+            die("--out 非法 glob %r: %s" % (pat, exc))
+        for p in matches:
+            try:
+                if not p.is_file():
+                    continue
+                rel = str(p.relative_to(root)).replace("\\", "/")
+                st = p.stat()
+                out[rel] = {"sha256": sha256_file(p), "size": st.st_size,
+                            "mtime": st.st_mtime}
+            except OSError:
+                continue
+    return out
+
+
+def _check_outputs(root: Path, patterns: List[str], pre: Dict[str, dict],
+                   run_start: float) -> Tuple[List[dict], List[str]]:
+    """产物新鲜度断言：声明的产物在运行后必须存在且新于本次运行起点。
+    「新」= 运行前不存在 / mtime 更新（容忍 1s 粒度）/ 内容 hash 变化，其一。
+    返回 (outputs 记录, 失败原因列表)。"""
+    post = _snapshot_outputs(root, patterns)
+    outputs: List[dict] = []
+    failures: List[str] = []
+    if patterns and not post:
+        failures.append(
+            "声明的产物 %s 在运行后仍不存在——验收命令没有产出声明的结果"
+            % ", ".join(patterns))
+        return outputs, failures
+    for rel, cur in sorted(post.items()):
+        old = pre.get(rel)
+        fresh = old is None \
+            or cur["mtime"] >= run_start - 1.0 \
+            or cur["sha256"] != old["sha256"]
+        outputs.append({
+            "path": rel, "sha256": cur["sha256"], "size": cur["size"],
+            "mtime": cur["mtime"], "existed_before": old is not None,
+            "fresh": fresh,
+        })
+        if not fresh:
+            failures.append(
+                "产物 %s 未更新（mtime/size/hash 与运行前一致）——"
+                "疑似陈旧产物冒充新结果" % rel)
+    return outputs, failures
+
+
+def _check_log_patterns(rec: dict, requires: List[str],
+                        forbids: List[str]) -> Tuple[List[dict], List[str]]:
+    """日志断言：--require 必须命中（路径激活正证据），--forbid 不得命中
+    （回退红线——回退日志是红灯，不是噪音）。"""
+    hay = (rec.get("stdout") or "") + "\n" + (rec.get("stderr") or "")
+    checks: List[dict] = []
+    failures: List[str] = []
+    for pat in requires:
+        hit = re.search(pat, hay)
+        checks.append({"kind": "require", "pattern": pat, "ok": bool(hit)})
+        if not hit:
+            failures.append(
+                "--require 未命中: %s——目标路径激活的正证据缺失" % pat)
+    for pat in forbids:
+        hit = re.search(pat, hay)
+        checks.append({"kind": "forbid", "pattern": pat, "ok": hit is None})
+        if hit:
+            failures.append(
+                "--forbid 命中: %s → %r——触发回退红线" % (
+                    pat, (hit.group(0) or "")[:60]))
+    return checks, failures
+
+
+def _check_must_differ(root: Path, sid: str, label: str,
+                       outputs: List[dict]) -> Optional[str]:
+    """负对照：与同 step 内最近一条 label 相同、且带产物的通过证据比较 hash。
+    产物完全一致 = 开关没有产生可观测差异 = 疑似目标路径从未生效。
+    声明了开关实验却无可比产物，同样判失败（差异不可观测即不可证伪）。"""
+    prev = None
+    for e in _step_evidence(root, sid):
+        if e.get("label") == label and e.get("exit_code") == 0 \
+                and not e.get("timed_out") and e.get("outputs"):
+            prev = e
+    if prev is None:
+        return ("--must-differ %s：本 step 内没有该 label 的带产物通过证据"
+                "可对照（先跑对照组）" % label)
+    cur = {o["path"]: o["sha256"] for o in outputs}
+    old = {o["path"]: o["sha256"] for o in prev.get("outputs", [])}
+    if not cur:
+        return ("--must-differ 要求本次也用 --out 声明产物，"
+                "否则开关差异不可观测")
+    common = set(cur) & set(old)
+    if common and all(cur[p] == old[p] for p in common):
+        return ("产物与对照组（label=%s, %s）完全一致——"
+                "「一致」在此是红灯：疑似根本没切换路径" % (
+                    label, prev.get("ts", "")))
+    return None
+
+
+def _run_verify_command(root: Path, command: str, timeout: int) -> dict:
+    """harness 亲自执行验收命令，返回证据记录。命令在项目根执行。"""
+    if timeout <= 0 or timeout > MAX_VERIFY_TIMEOUT:
+        timeout = MAX_VERIFY_TIMEOUT
+    start = now_epoch()
+    try:
+        proc = subprocess.run(
+            command, shell=True, cwd=str(root), capture_output=True,
+            text=True, timeout=timeout, env={**os.environ, "CI": "1"})
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        exit_code = proc.returncode
+        timed_out = False
+    except subprocess.TimeoutExpired as exc:
+        stdout = (exc.stdout or b"").decode("utf-8", "replace") \
+            if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = (exc.stderr or b"").decode("utf-8", "replace") \
+            if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        stderr += "\n[harness] 超时（%d 秒）" % timeout
+        exit_code = -1
+        timed_out = True
+    except Exception as exc:
+        stdout = ""
+        stderr = "harness 执行失败: %s: %s" % (type(exc).__name__, exc)
+        exit_code = -1
+        timed_out = False
+    elapsed = now_epoch() - start
+
+    # 截断超长输出
+    if len(stdout) > MAX_EVIDENCE_BYTES:
+        stdout = stdout[:MAX_EVIDENCE_BYTES] + "\n...[truncated by harness]"
+    if len(stderr) > MAX_EVIDENCE_BYTES:
+        stderr = stderr[:MAX_EVIDENCE_BYTES] + "\n...[truncated by harness]"
+
+    blob = json.dumps({
+        "command": command, "exit_code": exit_code, "stdout": stdout,
+        "stderr": stderr, "elapsed": elapsed, "timed_out": timed_out,
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return {
+        "command": command, "exit_code": exit_code,
+        "stdout": stdout, "stderr": stderr, "elapsed": round(elapsed, 3),
+        "timed_out": timed_out, "hash": sha256_bytes(blob),
+        "ts": now_iso(), "ts_epoch": start,
+    }
+
+
+def _write_evidence(root: Path, step_id: str, rec: dict) -> Path:
+    sdir = evidence_step_dir(root, _sanitize_step_id(step_id))
+    sdir.mkdir(parents=True, exist_ok=True)
+    fname = "%s-%s.json" % (
+        datetime.now().strftime("%Y%m%dT%H%M%S"), rec["hash"][:8])
+    path = sdir / fname
+    path.write_text(json.dumps(rec, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return path
+
+
+def _step_evidence(root: Path, step_id: str) -> List[dict]:
+    sdir = evidence_step_dir(root, _sanitize_step_id(step_id))
+    if not sdir.is_dir():
+        return []
+    out = []
+    for p in sorted(sdir.glob("*.json")):
+        rec = read_json(p, {})
+        if isinstance(rec, dict) and rec.get("command"):
+            rec["_file"] = str(p.relative_to(root))
+            out.append(rec)
+    return out
+
+
+def _evidence_passed(e: dict) -> bool:
+    """通过判据：exit=0 且未超时，且四道硬断言全过（旧证据无 passed 字段时
+    按 exit_code 判定，向后兼容）。"""
+    if e.get("timed_out"):
+        return False
+    if "passed" in e:
+        return bool(e.get("passed"))
+    return e.get("exit_code") == 0
+
+
+def _step_last_write_epoch(root: Path, sid: str) -> float:
+    """该 step 内最后一次发布类事件（publish/adopt）的时刻。"""
+    last = 0.0
+    for r in iter_jsonl(manifest_path(root)):
+        if str(r.get("step")) == sid and r.get("event") in ("publish", "adopt"):
+            try:
+                last = max(last, float(r.get("ts_epoch") or 0))
+            except (TypeError, ValueError):
+                continue
+    return last
+
+
+def _step_has_passing_evidence(root: Path, step_id: str) -> Tuple[bool, str]:
+    """返回 (是否有通过证据, 说明)。通过证据还必须新鲜：
+    晚于该 step 最后一次 publish/adopt——改了代码拿旧证据收尾一律拒绝。"""
+    evs = _step_evidence(root, step_id)
+    if not evs:
+        return False, "无任何验收证据（该 step 未运行 harness verify）"
+    passing = [e for e in evs if _evidence_passed(e)]
+    if not passing:
+        last = evs[-1]
+        why = "最近一次验收未通过（exit=%s%s）：%s" % (
+            last.get("exit_code"),
+            " 超时" if last.get("timed_out") else "",
+            (last.get("command") or "")[:80])
+        fails = last.get("check_failures") or []
+        if fails:
+            why += "\n  断言失败: " + "；".join(str(f)[:100] for f in fails[:3])
+        return False, why
+    last_write = _step_last_write_epoch(root, step_id)
+    fresh = [e for e in passing
+             if float(e.get("ts_epoch") or 0) >= last_write - 1.0]
+    if not fresh:
+        return False, ("证据已过期：该 step 最后一次 publish/adopt 晚于最近"
+                       "通过的验收——代码在验收之后又改过，必须重新 verify")
+    last_write = _step_last_write_epoch(root, step_id)
+    fresh = [e for e in passing
+             if float(e.get("ts_epoch") or 0) >= last_write - 1.0]
+    if not fresh:
+        return False, ("证据已过期：该 step 最后一次 publish/adopt 晚于最近"
+                       "通过的验收——代码在验收之后又改过，必须重新 verify")
+    return True, "通过（%d 条新鲜证据，最近 exit=0）" % len(fresh)
+
+
+def _step_committed_evidence(root: Path, step_id: str) -> Optional[dict]:
+    """该 step 最新一条 phase-2（--commit）确认过的证据；无则 None。"""
+    evs = _step_evidence(root, step_id)
+    for e in reversed(evs):
+        if e.get("committed") is True and e.get("exit_code") == 0 \
+                and not e.get("timed_out"):
+            return e
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 二次提交（phase-2 commit）：验证路径≠用户路径的意图复核闸
+# --------------------------------------------------------------------------- #
+# 背景（第十四期 Step 190 复发）：`verify` 的四道硬断言只验 stdout/产物干不
+# 干净，拦不住「验了 A 层（如 /api/stats），却拿它当 B 层（dashboard UI）
+# 已实现」的证据。机械断言测不出"命令覆盖的对象是否等于用户看到的对象"，
+# 只能靠"提交时的一次强制意图复核"来堵。
+#
+# 方案：证据分两阶段。
+#   phase-1（普通 verify）：跑命令 + 四道断言 + 写证据，harness 生成一次性
+#     confirm token（只在终端打印、只用 token 的 sha256 落盘）。此时证据
+#     尚未"入账"，step done 不会采信。
+#   phase-2（verify --commit --token <t> [--intent "..."]）：校验 token 与
+#     该 step 最近一条通过证据绑定，否则拒绝；把证据标记 committed=true、
+#     phase=2，并可选归档 --intent 的"覆盖层级/交付对象"书面陈述。
+#   step done --token <t>：要求该 step 有 phase=2 通过证据，且 token 匹配，
+#     才允许收尾。
+# 信任边界：token 允许 AI 读取回填（效率优先，依赖模型合规）。设计防的是
+# "结构性绕过"——AI 硬编码认领一条 phase-2、或跳过二次提交直接收尾——而
+# 不是防受信模型本身。token 只存 hash，UI 伪造不出绑定。
+def _confirm_token() -> str:
+    """生成一次性确认 token（URL 安全）。文本只出现在 phase-1 的终端输出。"""
+    return secrets.token_urlsafe(18)
+
+
+def _token_hash(tok: str) -> str:
+    return hashlib.sha256(("confirm:" + tok).encode("utf-8")).hexdigest()
+
+
+def _rewrite_evidence_rec(root: Path, rec: dict) -> Path:
+    """原地重写单条证据文件，并登记 manifest 使对账通过。
+
+    phase-2 commit 会改 plain-text 证据（加 committed/phase/intent），据此重写，
+    保留原 evidence 路径。由于 _registered 以"该路径最后一条 manifest 记录"的
+    hash_after 为准，这里追加一条 event=verify 记录承载新 hash，避免对账把这次
+    改写判成篡改；用 commit=true 字段与普通 phase-1 的 verify 记录区分。"""
+    fpath = Path(root) / rec["_file"]
+    fpath.write_text(json.dumps(rec, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+    rel = str(fpath.relative_to(root)).replace("\\", "/")
+    new_hash = sha256_file(fpath)
+    append_jsonl(manifest_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "verify",
+        "commit": True,  # 标识这是 phase-2 二次提交改写
+        "path": rel, "step": rec.get("step"),
+        "hash_after": new_hash, "bytes": fpath.stat().st_size,
+    })
+    return fpath
+
+
+def _latest_passable_evidence(evs: List[dict]) -> Optional[dict]:
+    """取同 step 内最新一条 passed=true 且未提交的通过证据（phase-1 候选）。
+
+    必须按 passed 过滤而非 exit_code：--require/--forbid/--must-differ 断言
+    失败的证据同样可能 exit=0，但没有 confirm_hash（只在 passed 时写入），
+    若被误选为候选会使 phase-2 永远卡在「confirm_hash 缺失」。"""
+    recs = [e for e in evs if e.get("passed") is True
+            and e.get("committed") is not True]
+    return recs[-1] if recs else None
+
+
+def _commit_evidence(root: Path, step: str, token: str,
+                     intent: str) -> Tuple[bool, str]:
+    """phase-2 入库：把该 step 最新一条 phase-1 通过证据标记已确认。
+
+    校验：--token 的 sha256 必须等于 phase-1 生成时写进该证据的 confirm_hash
+    （token 文本只在 phase-1 输出里存在过；此处只比 hash，不落明文）。匹配即
+    重写证据为 committed=true/phase=2，并附 --intent 的覆盖层级陈述。"""
+    target = _latest_passable_evidence(_step_evidence(root, step))
+    if target is None:
+        return False, ("该 step 没有可提交的通过证据——请先跑 `verify` 拿到确认"
+                       "token（phase-1 通过并打印 token）")
+    stored_hash = target.get("confirm_hash")
+    if not stored_hash:
+        return False, ("证据未携带 phase-1 确认 hash（confirm_hash 缺失）——"
+                       "疑似旧版本别名或被篡改，无法绑定 token")
+    if stored_hash != _token_hash(token):
+        return False, ("确认 token 不匹配：拒绝伪造成交。请原样使用 phase-1 "
+                       "打印的那个 token 重新提交。")
+    target["committed"] = True
+    target["phase"] = 2
+    target["commit_ts"] = now_iso()
+    target["intent"] = (intent or "").strip()
+    _rewrite_evidence_rec(root, target)
+    return True, ("证据已 phase-2 确认（committed=true）：%s"
+                  % target.get("_file"))
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """harness 亲自执行验收命令并固化证据。AI 自述的验收结果一律不算。
+    exit=0 只是必要条件；四道硬断言（--out/--require/--forbid/--must-differ）
+    任一不过同样判 FAIL——防止「跑了但通过是空心的」。"""
+    root = require_root()
+    st = load_state(root)
+    if not st:
+        die("未初始化。")
+    sid = args.step or (st.get("open_step") or {}).get("id")
+    if not sid:
+        die("未指定 step 且无进行中的 step。用 --step <id>。")
+    sid = str(sid)
+    command = args.command or ""
+
+    # --commit：二次提交（phase-2）专用分支，不需要命令，但要 token 绑定。
+    if args.commit:
+        if not args.token:
+            die("--commit 必须带 --token <TOKEN>（由上一次通过时 harness 打印）。")
+        ok, msg = _commit_evidence(root, sid, args.token, args.intent or "")
+        if not ok:
+            die("二次提交失败：%s" % msg)
+        print("[verify] phase-2 已确认  step=%s" % sid)
+        print("  %s" % msg)
+        return 0
+
+    if not command.strip():
+        die("验收命令不能为空。")
+    # 防注入：命令由 harness 执行，但仍拒绝明显危险模式
+    danger = re.search(r"\b(rm\s+-rf\s+/\s|:\(\)\s*\{\|.*\}&\}|mkfs|dd\s+if=)",
+                       command)
+    if danger:
+        die("拒绝执行疑似危险命令: %s" % command[:80])
+
+    out_patterns = _validate_out_patterns(args.out or [])
+    for pat in (args.require or []) + (args.forbid or []):
+        try:
+            re.compile(pat)
+        except re.error as exc:
+            die("无效正则 %r: %s" % (pat, exc))
+
+    pre = _snapshot_outputs(root, out_patterns) if out_patterns else {}
+    rec = _run_verify_command(root, command, args.timeout)
+    rec["step"] = sid
+    rec["label"] = args.label or ""
+
+    # 四道硬断言（exit=0 之外的防空心通过判据）
+    failures: List[str] = []
+    outputs: List[dict] = []
+    checks: List[dict] = []
+    if out_patterns:
+        outputs, out_fail = _check_outputs(
+            root, out_patterns, pre, rec["ts_epoch"])
+        failures.extend(out_fail)
+    if (args.require or []) or (args.forbid or []):
+        log_checks, log_fail = _check_log_patterns(
+            rec, args.require or [], args.forbid or [])
+        checks.extend(log_checks)
+        failures.extend(log_fail)
+    if args.must_differ:
+        diff_fail = _check_must_differ(root, sid, args.must_differ, outputs)
+        checks.append({"kind": "must_differ", "pattern": args.must_differ,
+                       "ok": diff_fail is None})
+        if diff_fail:
+            failures.append(diff_fail)
+
+    rec["outputs"] = outputs
+    rec["checks"] = checks
+    rec["check_failures"] = failures
+    rec["passed"] = rec["exit_code"] == 0 and not failures
+
+    # phase-1：这次通过只作为一个"暂存证据"。为它绑定一次性确认 token：
+    # token 文本仅打印到终端，证据里只存 sha256，供 phase-2 --commit 校验。
+    # （不信 AI 自述 → 上一步通过了不自动入库；--commit 才完成二次提交。）
+    token_for_print = ""
+    if rec["passed"]:
+        confirm_token = _confirm_token()
+        token_for_print = confirm_token
+        rec["confirm_hash"] = _token_hash(confirm_token)
+        rec["phase"] = 1
+        rec["committed"] = False
+        rec["intent"] = (args.intent or "").strip()
+
+    path = _write_evidence(root, sid, rec)
+    # 证据文件登记到 manifest（纳入对账，防篡改）
+    rel = str(path.relative_to(root)).replace("\\", "/")
+    file_hash = sha256_file(path)
+    append_jsonl(manifest_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "verify",
+        "path": rel, "step": sid, "hash_after": file_hash,
+        "verify_hash": rec["hash"],  # 证据内容 hash（command/exit/stdout 等）
+        "command": command, "exit_code": rec["exit_code"],
+        "passed": rec["passed"], "label": args.label or "",
+        "bytes": path.stat().st_size,
+    })
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "verify",
+        "step": sid, "message": "验收 %s（exit=%s%s）：%s" % (
+            "通过" if rec["passed"] else "未通过", rec["exit_code"],
+            "，断言失败 %d 项" % len(failures) if failures else "",
+            args.label or command[:60]),
+        "files": [rel],
+    })
+    status = "PASS" if rec["passed"] else "FAIL"
+    print("[verify] %s  step=%s  exit=%d  %.1fs  hash=%s" % (
+        status, sid, rec["exit_code"], rec["elapsed"], rec["hash"][:12]))
+    print("  command: %s" % command)
+    if args.label:
+        print("  label:   %s" % args.label)
+    print("  evidence: %s" % rel)
+    for o in outputs:
+        print("  output:  %s  %s  %dB  %s" % (
+            "✓新鲜" if o["fresh"] else "✗陈旧",
+            o["sha256"][:12], o["size"], o["path"]))
+    for c in checks:
+        print("  check:   %s %s %s" % (
+            "✓" if c["ok"] else "✗", c["kind"], c["pattern"][:60]))
+    for f in failures:
+        print("  FAIL:    %s" % f)
+    if rec["stdout"]:
+        print("--- stdout (tail) ---")
+        print("\n".join(rec["stdout"].splitlines()[-20:]))
+    if not rec["passed"] and rec["stderr"]:
+        print("--- stderr (tail) ---")
+        print("\n".join(rec["stderr"].splitlines()[-20:]))
+
+    # ---- 二次提交提示（phase-1 通过后强制展现）----
+    if rec["passed"]:
+        print()
+        print("=" * 72)
+        print("★ 验证意图复核（来自 harness，非自述）—— 这次只是 phase-1 暂存")
+        print("★ 你刚才验证了: %s" % command)
+        print("★ 你声明的覆盖对象: %r" % (args.intent or "(未声明 —--intent)"))
+        print("  请逐项核对（写入 --intent 一并提交）：")
+        print("  ① 命令实际验的是哪一层？(cli / API / 模块内 / 浏览器渲染 DOM /")
+        print("    用户键盘流水线)")
+        print("  ② 你声称'已实现/通过'的是哪一层？与 ① 是否同一层？")
+        print("  ③ 若不同层——你并没有验到用户看到的那层，请补跑真正覆盖该层的")
+        print("    验收命令，而不要拿这层的证据冒充。")
+        print("★ 确认：phase-1 尚未入账。二次提交（正式入库）用：")
+        print("    harness verify --step %s --commit --token %s" % (sid, token_for_print))
+        print("       [--intent \"覆盖层级=...; 交付对象=...; 与用户路径同一对象\"]")
+        print("★ 该 token 一次性；只在本终端打印，AI 可读取回填但使用后即失效。")
+        print("=" * 72)
+    return 0 if rec["passed"] else 2
+
+
+def cmd_evidence(args: argparse.Namespace) -> int:
+    """查看某 step 的验收证据链。"""
+    root = require_root()
+    sid = args.step
+    evs = _step_evidence(root, sid)
+    if not evs:
+        ok("step %s 无验收证据。" % sid)
+        return 1
+    print("step %s 验收证据链（%d 条，按时间序）：" % (sid, len(evs)))
+    for e in evs:
+        mark = "✓" if _evidence_passed(e) else "✗"
+        print("  %s %s  exit=%-3d  %.1fs  %s" % (
+            mark, e.get("ts", ""), e.get("exit_code", "?"),
+            e.get("elapsed", 0), (e.get("label") or e.get("command") or "")[:60]))
+        for f in (e.get("check_failures") or [])[:3]:
+            print("      FAIL: %s" % str(f)[:100])
+        for o in (e.get("outputs") or [])[:6]:
+            print("      %s %s  %dB  %s" % (
+                "新鲜" if o.get("fresh") else "陈旧",
+                (o.get("sha256") or "")[:12], o.get("size", 0),
+                o.get("path", "")))
+    passed, why = _step_has_passing_evidence(root, sid)
+    print("\n结论：%s" % ("通过" if passed else "未通过"))
+    return 0 if passed else 2
+
+
+# --------------------------------------------------------------------------- #
+# log / status / abort
+# --------------------------------------------------------------------------- #
+def cmd_log(args: argparse.Namespace) -> int:
+    root = require_root()
+    words = args.words or []
+    if words and words[0] == "why":
+        if len(words) < 2:
+            die("用法: harness log why <file>")
+        rel = words[1].replace("\\", "/").lstrip("./")
+        recs = [r for r in iter_jsonl(manifest_path(root))
+                if r.get("path") == rel]
+        if not recs:
+            ok("%s 没有发布记录。" % rel)
+            return 1
+        steps = {str(r.get("step")) for r in recs if r.get("step")}
+        for r in recs:
+            print("%s  %-8s step=%-6s %s" % (
+                r.get("ts", ""), r.get("event", ""), r.get("step", "-"),
+                "hash=" + str(r.get("hash_after"))[:12]))
+        for w in iter_jsonl(worklog_path(root)):
+            if w.get("event") == "step_done" and str(w.get("step")) in steps:
+                print("  step %s @ %s: %s" % (
+                    w.get("step"), w.get("ts", ""), w.get("message", "")))
+        return 0
+
+    recs = iter_jsonl(manifest_path(root))[-args.limit:]
+    if not recs:
+        ok("manifest 为空。")
+        return 0
+    for r in recs:
+        extra = ""
+        if r.get("event") == "verify":
+            ok_flag = r.get("passed")
+            mark = ("✓" if ok_flag else "✗") if ok_flag is not None \
+                else ("✓" if r.get("exit_code") == 0 else "✗")
+            extra = " %s exit=%s %s" % (mark, r.get("exit_code"),
+                                       (r.get("label") or r.get("command") or "")[:40])
+        print("%s  %-8s step=%-6s %s %s%s" % (
+            r.get("ts", ""), r.get("event", ""), r.get("step", "-"),
+            r.get("path", "-"), (str(r.get("hash_after") or ""))[:12], extra))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    root = require_root()
+    st = load_state(root)
+    plan = root / PLAN_FILE
+    plan_ok = bool(st.get("plan_approved")) and plan.is_file() \
+        and sha256_file(plan) == st.get("plan_sha256")
+    print("task      : %s" % st.get("task_id", "?"))
+    print("phase     : %s" % st.get("phase", "?"))
+    print("plan      : %s" % ("APPROVED" if plan_ok else "NOT_APPROVED"))
+    op = st.get("open_step") or {}
+    print("open step : %s" % (("%s %s" % (op.get("id"), op.get("title", "")))
+                              if op else "-"))
+    print("last step : %s" % (st.get("last_step") or "-"))
+    print("pending   : %d" % len(list(pending_dir(root).glob("tkt-*.json"))))
+    op = st.get("open_step") or {}
+    if op.get("id"):
+        passed, why = _step_has_passing_evidence(root, op["id"])
+        print("verify    : %s" % why)
+    bad = reconcile(root)
+    print("reconcile : %s" % ("clean" if not bad else
+                              "%d unregistered" % len(bad)))
+    for rel, why in bad[:10]:
+        print("  - %s (%s)" % (rel, why))
+    return 0
+
+
+def cmd_abort(args: argparse.Namespace) -> int:
+    root = require_root()
+    verify_passphrase()
+
+    target = args.to
+    if not target:
+        tags = git_tags_matching(root, "harness-s*")
+        if tags:
+            target = tags[0]
+        elif git(root, "rev-parse", "--verify", "harness-baseline").returncode == 0:
+            target = "harness-baseline"
+        else:
+            die("找不到可回退的 checkpoint tag。")
+    epoch = git_tag_epoch(root, target)
+    if epoch is None:
+        die("tag 不存在或无法解析：%s" % target)
+
+    changed = [r for r in iter_jsonl(manifest_path(root))
+               if float(r.get("ts_epoch") or 0) > epoch
+               and r.get("event") in WRITE_EVENTS]
+    if changed:
+        print("将回退到 %s，以下发布会被撤销：" % target)
+        for r in changed:
+            print("  - %s  (%s)" % (r.get("path"), r.get("ts", "")))
+    else:
+        print("将回退到 %s（上个 checkpoint 之后没有发布记录）。" % target)
+    if not confirm_input("确认执行 git reset --hard？"):
+        die("已取消。")
+
+    # 删除 tag 之后通过 publish 新建的、尚未被 git 跟踪的文件
+    for r in changed:
+        rel = r.get("path") or ""
+        p = root / rel
+        if not rel or not p.is_file():
+            continue
+        tracked = git(root, "ls-files", "--error-unmatch", "--", rel)
+        if tracked.returncode != 0:
+            try:
+                p.unlink()
+                ok("已删除未跟踪的新文件 %s" % rel)
+            except Exception:
+                pass
+    git(root, "reset", "--hard", target, check=True)
+    pending = pending_dir(root)
+    if pending.is_dir():
+        for t in pending.glob("tkt-*.json"):
+            _drop_ticket(t)
+    # Task 状态机：-> ABORTING -> ABORTED；重置 v3 执行态
+    st = load_state(root)
+    st["open_step"] = None
+    st["current_step"] = None
+    save_state(root, st)
+    _sm_transition_task(root, TaskStatus.ABORTING, event="abort",
+                         rollback_to=target)
+    _sm_transition_task(root, TaskStatus.ABORTED, event="abort_done")
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "abort",
+        "step": None, "message": "reset --hard " + target, "files": [],
+    })
+    ok("已回退到 %s。" % target)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# lock / pre-commit / doctor
+# --------------------------------------------------------------------------- #
+def lock_candidates(root: Path) -> List[str]:
+    rels = [".harness/scripts/harness", ".harness/scripts/git_hooks/pre-commit",
+            ".harness/state_machine.py",
+            ".harness/scripts/harness_plan_generator.py",
+            ".harness/scripts/harness_replan.py",
+            ".harness/scripts/harness_validate_state.py",
+            ".harness/scripts/harness_state_inspector.py"]
+    # 仅对实际存在的文件保留（升级时旧版可能尚未铺这些模块）
+    rels = [r for r in rels if (root / r).is_file()]
+    hk = hdir(root) / "codex_hooks"
+    if hk.is_dir():
+        for p in sorted(hk.glob("*.py")):
+            rels.append(str(p.relative_to(root)).replace("\\", "/"))
+    clk = hdir(root) / "claude_hooks"
+    if clk.is_dir():
+        for p in sorted(clk.glob("*.py")):
+            rels.append(str(p.relative_to(root)).replace("\\", "/"))
+    for extra in (".codex/hooks.json", ".claude/settings.json",
+                  ".git/hooks/pre-commit"):
+        if (root / extra).is_file():
+            rels.append(extra)
+    return rels
+
+
+def cmd_write_lock(args: argparse.Namespace) -> int:
+    root = require_root()
+    files: Dict[str, str] = {}
+    for rel in lock_candidates(root):
+        digest = sha256_file(root / rel)
+        if digest:
+            files[rel] = digest
+    write_json(hdir(root) / "lock.json", {
+        "version": VERSION,
+        "generated_at": now_iso(),
+        "files": files,
+    })
+    ok("lock.json 已写入（%d 个文件）。" % len(files))
+    return 0
+
+
+def verify_lock(root: Path) -> Tuple[bool, List[str]]:
+    lock = read_json(hdir(root) / "lock.json", {})
+    entries = lock.get("files") if isinstance(lock, dict) else None
+    if not entries:
+        return False, ["lock.json missing/empty"]
+    bad = [rel for rel, expect in entries.items()
+           if sha256_file(root / rel) != expect]
+    return (not bad), bad
+
+
+def cmd_precommit(args: argparse.Namespace) -> int:
+    root = require_root()
+    cur = current_branch(root)
+    if is_protected_branch(root, cur):
+        sys.stderr.write(
+            "harness: 保护分支 %s 禁止直接提交。\n"
+            "        请在开发分支上提交；合入由用户运行 harness merge 完成。\n"
+            % cur)
+        return 1
+    good, bad = verify_lock(root)
+    if not good:
+        sys.stderr.write(
+            "harness: 防篡改锁单校验失败，拒绝提交：%s\n"
+            "        请用户运行 install.sh --upgrade 修复。\n"
+            % ", ".join(bad))
+        return 1
+    problems = reconcile(root)
+    if problems:
+        sys.stderr.write("harness: 存在未登记改动，拒绝提交：\n")
+        for rel, why in problems:
+            sys.stderr.write("  - %s (%s)\n" % (rel, why))
+        return 1
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    root = require_root()
+    fails = 0
+    warns = 0
+
+    def report(level: str, msg: str) -> None:
+        nonlocal fails, warns
+        print("[%s] %s" % (level, msg))
+        if level == "FAIL":
+            fails += 1
+        elif level == "WARN":
+            warns += 1
+
+    report("OK", "project root: %s" % root)
+    st = load_state(root)
+    report("OK" if st else "FAIL", "state.json %s" % ("ok" if st else "missing"))
+    plan = root / PLAN_FILE
+    if plan.is_file() and st.get("plan_approved") \
+            and sha256_file(plan) == st.get("plan_sha256"):
+        report("OK", "plan approved")
+    else:
+        report("WARN", "plan not approved (or changed since approval)")
+    good, bad = verify_lock(root)
+    report("OK" if good else "FAIL",
+           "lock.json %s" % ("verified" if good else "BROKEN: " + ", ".join(bad)))
+    for rel in lock_candidates(root):
+        if not (root / rel).is_file():
+            report("FAIL", "lock target missing: %s" % rel)
+    report("OK" if is_git_repo(root) else "FAIL",
+           "git repo %s" % ("ok" if is_git_repo(root) else "missing"))
+    report("OK" if secret_path().is_file() else "FAIL",
+           "passphrase %s" % ("installed" if secret_path().is_file() else "missing"))
+    hk = hdir(root) / "codex_hooks" / "pre_tool_use.py"
+    report("OK" if hk.is_file() else "WARN",
+           "codex hooks %s" % ("installed" if hk.is_file() else "absent"))
+    chk = hdir(root) / "claude_hooks" / "pre_tool_use.py"
+    report("OK" if chk.is_file() else "WARN",
+           "claude hooks %s" % ("installed" if chk.is_file() else "absent"))
+    pre = root / ".git" / "hooks" / "pre-commit"
+    report("OK" if pre.is_file() else "WARN",
+           "git pre-commit %s" % ("installed" if pre.is_file() else "absent"))
+    cur = current_branch(root)
+    report("WARN" if is_protected_branch(root, cur) else "OK",
+           "branch %s %s" % (cur or "?",
+                             "PROTECTED（任务须在开发分支）"
+                             if is_protected_branch(root, cur) else
+                             ("dev（基线 %s）" % (st.get("base_branch") or "?")
+                              if st.get("dev_branch") else "")))
+    mr = st.get("merge_request")
+    if isinstance(mr, dict) and mr.get("status") == "pending":
+        report("WARN", "merge 请求待人工处理：%s -> %s"
+                % (mr.get("dev"), mr.get("target")))
+    pend = len(list(pending_dir(root).glob("tkt-*.json"))) \
+        if pending_dir(root).is_dir() else 0
+    report("WARN" if pend else "OK", "pending tickets: %d" % pend)
+    scratch = root / SCRATCH_DIR
+    report("OK" if scratch.is_dir() else "WARN",
+           "scratch %s %s" % (SCRATCH_DIR,
+                              "ok" if scratch.is_dir()
+                              else "missing (AI 首次 Write 时自动创建)"))
+    bad2 = reconcile(root)
+    report("WARN" if bad2 else "OK",
+           "reconcile %s" % ("clean" if not bad2 else
+                              "%d unregistered" % len(bad2)))
+    if bad2:
+        for rel, why in bad2[:10]:
+            print("       - %s (%s)" % (rel, why))
+    print("\n%s（fail=%d warn=%d）" % (
+        "DOCTOR: FAIL" if fails else "DOCTOR: PASS", fails, warns))
+    return 1 if fails else 0
+
+
+# --------------------------------------------------------------------------- #
+# dashboard
+# --------------------------------------------------------------------------- #
+def _render_dashboard(root: Path) -> str:
+    st = load_state(root)
+    plan = root / PLAN_FILE
+    plan_ok = bool(st.get("plan_approved")) and plan.is_file() \
+        and sha256_file(plan) == st.get("plan_sha256")
+    todos: List[str] = []
+    if plan.is_file():
+        for line in plan.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"\s*[-*]\s*\[ \]\s*(.+)", line)
+            if m:
+                todos.append(m.group(1).strip())
+    work = iter_jsonl(worklog_path(root))[-12:][::-1]
+    man = iter_jsonl(manifest_path(root))[-20:][::-1]
+    tickets = []
+    if pending_dir(root).is_dir():
+        for p in sorted(pending_dir(root).glob("tkt-*.json")):
+            r = read_json(p, {})
+            tickets.append(r)
+    denials = []
+    if denials_path(root).is_file():
+        try:
+            denials = denials_path(root).read_text(
+                encoding="utf-8", errors="replace").splitlines()[-12:][::-1]
+        except Exception:
+            pass
+    allow = read_json(allowlist_path(root), {}) or {}
+    entries = allow.get("entries", []) if isinstance(allow, dict) else []
+    bad = reconcile(root)
+
+    def esc(x: Any) -> str:
+        return html.escape(str(x))
+
+    def rows(items: Iterable[str]) -> str:
+        return "".join("<li>%s</li>" % i for i in items) or "<li class='muted'>—</li>"
+
+    op = st.get("open_step") or {}
+    card = """
+    <div class="card"><h2>状态</h2><table>
+      <tr><th>task</th><td>%s</td></tr>
+      <tr><th>phase</th><td>%s</td></tr>
+      <tr><th>plan</th><td class="%s">%s</td></tr>
+      <tr><th>open step</th><td>%s</td></tr>
+      <tr><th>last step</th><td>%s</td></tr>
+      <tr><th>reconcile</th><td class="%s">%s</td></tr>
+    </table></div>
+    """ % (
+        esc(st.get("task_id", "?")), esc(st.get("phase", "?")),
+        "good" if plan_ok else "bad",
+        "APPROVED" if plan_ok else "NOT_APPROVED",
+        esc(("%s %s" % (op.get("id"), op.get("title", ""))) if op else "—"),
+        esc(st.get("last_step") or "—"),
+        "good" if not bad else "bad",
+        "clean" if not bad else "%d unregistered" % len(bad),
+    )
+
+    pending_card = "<div class='card'><h2>待批授权票 (%d)</h2><ul>%s</ul></div>" % (
+        len(tickets), rows([
+            "tkt=%s · %s · %s" % (esc(t.get("id")), esc(t.get("kind")),
+                                  esc(t.get("reason")))
+            for t in tickets]))
+    work_card = "<div class='card'><h2>最近步骤</h2><ul>%s</ul></div>" % rows([
+        "%s step=%s %s %s" % (esc(w.get("ts", "")), esc(w.get("step") or "—"),
+                              esc(w.get("event", "")), esc(w.get("message", "")))
+        for w in work])
+    man_card = "<div class='card'><h2>最近发布</h2><ul>%s</ul></div>" % rows([
+        "%s %s step=%s %s" % (esc(m.get("ts", "")), esc(m.get("event", "")),
+                              esc(m.get("step") or "—"), esc(m.get("path", "")))
+        for m in man])
+    todo_card = "<div class='card'><h2>plan 待办</h2><ul>%s</ul></div>" % rows(
+        [esc(t) for t in todos[:20]])
+    deny_card = "<div class='card'><h2>最近拦截 / 许可</h2><ul>%s</ul></div>" % rows(
+        [esc(d) for d in denials] +
+        ["allow[%d] %s" % (i, esc(json.dumps(e, ensure_ascii=False)))
+         for i, e in enumerate(entries[-8:])])
+
+    return """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="3">
+<title>harness · %s</title>
+<style>
+:root{color-scheme:light dark}
+body{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:18px;background:#0f1115;color:#d7dae0}
+h1{font-size:17px;margin:0 0 14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.card{background:#171a21;border:1px solid #262b36;border-radius:8px;padding:12px 14px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#8b93a3;margin:0 0 8px}
+table{width:100%%;border-collapse:collapse}
+th{text-align:left;color:#8b93a3;font-weight:400;padding:2px 8px 2px 0;white-space:nowrap}
+td{padding:2px 0}
+ul{margin:0;padding-left:18px}
+li{margin:2px 0;word-break:break-all}
+.good{color:#5fd38d}.bad{color:#ff6b6b}.muted{color:#5b6270}
+</style></head><body>
+<h1>ai-coding-harness · live</h1>
+<div class="grid">%s%s%s%s%s%s</div>
+</body></html>""" % (esc(st.get("task_id", "?")), card, todo_card, work_card,
+                     man_card, pending_card, deny_card)
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    import http.server
+    import socketserver
+
+    root = require_root()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            body = _render_dashboard(root).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *a: Any) -> None:
+            return
+
+    class Server(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    port = args.port
+    for _ in range(25):
+        try:
+            httpd = Server((args.host, port), Handler)
+            break
+        except OSError:
+            port += 1
+    else:
+        die("无法绑定端口 %d..%d" % (args.port, args.port + 24))
+    print("dashboard: http://%s:%d/  (Ctrl-C 退出)" % (args.host, port))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nbye")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="harness", description="ai-coding-harness v%s CLI 网关" % VERSION)
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("init", help="初始化项目状态与 plan")
+    q.add_argument("--objective", default="")
+    q.add_argument("--task-id", default="")
+    q.add_argument("--scopes", nargs="*", default=[])
+    q.add_argument("--passphrase-file", default=None,
+                   help="从文件读取口令（仅限自动化安装/测试）")
+    q.add_argument("--force", action="store_true")
+    q.set_defaults(func=cmd_init)
+
+    q = sub.add_parser("publish", help="唯一项目文件写入通道")
+    q.add_argument("targets", nargs="+", metavar="DEST")
+    q.add_argument("--from", dest="froms", action="append", required=True,
+                   metavar="SRC")
+    q.add_argument("--note", default="")
+    q.set_defaults(func=cmd_publish)
+
+    q = sub.add_parser("approve", help="用户签字（需 TTY + 口令）")
+    q.set_defaults(func=cmd_approve)
+
+    q = sub.add_parser("step", help="step 生命周期")
+    ss = q.add_subparsers(dest="step_cmd", required=True)
+    s1 = ss.add_parser("start")
+    s1.add_argument("step")
+    s1.add_argument("--title", default="")
+    s1.set_defaults(func=cmd_step_start)
+    s2 = ss.add_parser("done")
+    s2.add_argument("step")
+    s2.add_argument("-m", "--message", default="")
+    s2.add_argument("--no-verify", action="store_true",
+                    help="免验收（需 --reason，可审计；仅用于纯规划等无需验收的 step）")
+    s2.add_argument("--reason", default="", help="--no-verify 的理由")
+    s2.add_argument("--token", default="",
+                   help="二次提交确认 token（须与该 step phase-1 提交时绑定的 token 一致）")
+    s2.set_defaults(func=cmd_step_done)
+
+    q = sub.add_parser("confirm", help="人工批准授权票（需 TTY + 口令）")
+    q.add_argument("ticket")
+    q.add_argument("--mode", choices=["once", "always", "program", "deny"],
+                   default=None)
+    q.set_defaults(func=cmd_confirm)
+
+    q = sub.add_parser("adopt", help="登记绕过 publish 的改动（需 TTY + 口令）")
+    q.add_argument("--path", action="append", default=[])
+    q.add_argument("--all", action="store_true")
+    q.add_argument("--reason", required=True)
+    q.set_defaults(func=cmd_adopt)
+
+    q = sub.add_parser("verify",
+                       help="harness 亲自执行验收命令并固化证据（防造假+防空心通过）")
+    q.add_argument("--step", default=None, help="step id（默认当前进行中）")
+    q.add_argument("--label", default="", help="验收标签（如 unit/integration）")
+    q.add_argument("--timeout", type=int, default=300, help="超时秒数（默认 300）")
+    q.add_argument("--out", action="append", default=[], metavar="GLOB",
+                   help="声明验收产物（项目内路径/glob，可多次）；harness 断言"
+                        "产物新于本次运行并记录 sha256——防陈旧产物冒充")
+    q.add_argument("--require", action="append", default=[], metavar="REGEX",
+                   help="输出必须命中（路径激活正证据，可多次），"
+                        "如 --require 'gpu_quads=[1-9]'")
+    q.add_argument("--forbid", action="append", default=[], metavar="REGEX",
+                   help="输出不得命中（回退红线，可多次），"
+                        "如 --forbid 'fallback|FORCE_SWRAST'")
+    q.add_argument("--must-differ", default="", metavar="LABEL",
+                   help="负对照：产物必须与同 step 内 label=LABEL 的通过证据"
+                        "有差异；完全一致=疑似没切换，判失败")
+    q.add_argument("--commit", action="store_true",
+                   help="二阶段提交：对前次通过的 phase-1 证据执行最终入库。"
+                        "依赖 --token 与该证据绑定的确认 token 匹配；并可选 --intent。")
+    q.add_argument("--token", default="", metavar="TOKEN",
+                   help="二次提交 token（由第一次通过时 harness 打印；绑定到该证据）")
+    q.add_argument("--intent", default="", metavar="STATEMENT",
+                   help="验证意图复核陈述：明确验收命令覆盖的层级（cli/API/浏览器渲染"
+                        "/用户路径）与交付声明；只有提交时归档，成为该条证据的一部分")
+    q.add_argument("command", nargs="?", default="",
+                   help="验收命令（由 harness 执行，非 AI）。--commit 时可选地省略")
+    q.set_defaults(func=cmd_verify)
+
+    q = sub.add_parser("evidence", help="查看某 step 的验收证据链")
+    q.add_argument("step")
+    q.set_defaults(func=cmd_evidence)
+
+    q = sub.add_parser("log", help="发布历史 / why <file>")
+    q.add_argument("words", nargs="*")
+    q.add_argument("--limit", type=int, default=40)
+    q.set_defaults(func=cmd_log)
+
+    q = sub.add_parser("status", help="状态摘要")
+    q.set_defaults(func=cmd_status)
+
+    q = sub.add_parser("abort", help="回退到上个 checkpoint（需 TTY + 口令）")
+    q.add_argument("--to", default=None)
+    q.set_defaults(func=cmd_abort)
+
+    q = sub.add_parser("branch", help="查看/变更保护分支（变更需 TTY + 口令）")
+    q.add_argument("--add", action="append", metavar="NAME")
+    q.add_argument("--remove", action="append", metavar="NAME")
+    q.set_defaults(func=cmd_branch)
+
+    q = sub.add_parser("complete",
+                       help="计划结项：生成 merge token，等待人工合入")
+    q.set_defaults(func=cmd_complete)
+
+    q = sub.add_parser("merge",
+                       help="无 --token：人工签发 merge token（需 TTY + 口令）；"
+                            "带 --token：执行一次性合入")
+    q.add_argument("--token", default="", metavar="TOKEN")
+    q.set_defaults(func=cmd_merge)
+
+    q = sub.add_parser("dashboard", help="本地实时 dashboard")
+    q.add_argument("--host", default="127.0.0.1")
+    q.add_argument("--port", type=int, default=8765)
+    q.set_defaults(func=cmd_dashboard)
+
+    q = sub.add_parser("doctor", help="健康检查")
+    q.set_defaults(func=cmd_doctor)
+
+    q = sub.add_parser("passwd", help="修改授权口令（需 TTY + 旧口令）")
+    q.set_defaults(func=cmd_passwd)
+
+    q = sub.add_parser("replan", help="任务树重编排（insert/reorder/split/merge/delete/update/list）")
+    q.add_argument("op", choices=["insert", "reorder", "split", "merge",
+                                  "delete", "update", "list"])
+    q.add_argument("--before", default=None)
+    q.add_argument("--after", default=None)
+    q.add_argument("--from", dest="from_step", default=None)
+    q.add_argument("--to", dest="to_step", default=None)
+    q.add_argument("--step", default=None)
+    q.add_argument("--title", default=None)
+    q.add_argument("--into", nargs="*", default=None)
+    q.add_argument("--description", default=None)
+    q.set_defaults(func=cmd_replan)
+
+    q = sub.add_parser("validate", help="校验 state.json 合法性")
+    q.set_defaults(func=cmd_validate)
+
+    q = sub.add_parser("inspect", help="详细状态检查（state/worklog/feedback/compliance/git）")
+    q.set_defaults(func=cmd_inspect)
+
+    q = sub.add_parser("plan-gen", help="根据目标生成 plan.md 骨架")
+    q.add_argument("objective")
+    q.add_argument("--scopes", nargs="*", default=[])
+    q.add_argument("--task-id", default=None)
+    q.set_defaults(func=cmd_plan_gen)
+
+    q = sub.add_parser("_reconcile", help=argparse.SUPPRESS)
+    q.add_argument("--quiet", action="store_true")
+    q.set_defaults(func=cmd_reconcile)
+
+    q = sub.add_parser("_precommit", help=argparse.SUPPRESS)
+    q.set_defaults(func=cmd_precommit)
+
+    q = sub.add_parser("_write-lock", help=argparse.SUPPRESS)
+    q.set_defaults(func=cmd_write_lock)
+
+    q = sub.add_parser("_ensure-passphrase", help=argparse.SUPPRESS)
+    q.add_argument("--passphrase-file", default=None)
+    q.set_defaults(func=lambda a: (ensure_passphrase(a.passphrase_file), 0)[1])
+
+    return p
+
+
+def cmd_passwd(args: argparse.Namespace) -> int:
+    root = require_root()
+    verify_passphrase("当前口令: ")
+    ensure_passphrase(rotate=True)
+    append_jsonl(worklog_path(root), {
+        "ts": now_iso(), "ts_epoch": now_epoch(), "event": "passwd",
+        "step": None, "message": "authorization passphrase rotated", "files": [],
+    })
+    ok("口令已更新。")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# 委托给 v2.2 独立脚本（replan / validate / inspect / plan-gen）
+# 这些脚本自包含、只读写 state.json/plan.md/worklog，作为子进程运行以保持隔离。
+# --------------------------------------------------------------------------- #
+def _run_script(root: Path, name: str, extra: List[str]) -> int:
+    script = hdir(root) / "scripts" / name
+    if not script.is_file():
+        die("缺少脚本：%s（请运行 install.sh --upgrade 补齐）" % script)
+    try:
+        proc = subprocess.run([sys.executable, str(script)] + extra,
+                              cwd=str(root), timeout=SCRIPT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        die("子脚本 %s 超时（%d 秒）" % (name, SCRIPT_TIMEOUT))
+    return proc.returncode
+
+
+def cmd_replan(args: argparse.Namespace) -> int:
+    root = require_root()
+    if args.op == "list":
+        return _run_script(root, "harness_replan.py", ["list"])
+    extra = [args.op]
+    if args.op == "insert":
+        if not args.before and not args.after:
+            die("insert 需要 --before 或 --after")
+        if args.before:
+            extra += ["--before", args.before]
+        if args.after:
+            extra += ["--after", args.after]
+        if args.title:
+            extra += ["--title", args.title]
+        if args.description:
+            extra += ["--description", args.description]
+    elif args.op == "reorder":
+        if not args.from_step or not args.to_step:
+            die("reorder 需要 --from 与 --to")
+        extra += ["--from", args.from_step, "--to", args.to_step]
+    elif args.op == "split":
+        if not args.step or not args.into or len(args.into) < 2:
+            die("split 需要 --step 与 --into（至少 2 个标题）")
+        extra += ["--step", args.step, "--into"] + args.into
+    elif args.op == "merge":
+        if not args.from_step or not args.to_step:
+            die("merge 需要 --from 与 --to")
+        extra += ["--from", args.from_step, "--to", args.to_step]
+    elif args.op == "delete":
+        if not args.step:
+            die("delete 需要 --step")
+        extra += ["--step", args.step]
+    elif args.op == "update":
+        if not args.step:
+            die("update 需要 --step")
+        extra += ["--step", args.step]
+        if args.title:
+            extra += ["--title", args.title]
+        if args.description:
+            extra += ["--description", args.description]
+    rc = _run_script(root, "harness_replan.py", extra)
+    if rc != 0:
+        return rc
+    # replan 改写了 plan.md / task_tree：原批准已失效。若任务在执行中，退回
+    # PLANNING 以便重新签字（与 publish plan.md 的 replan_in_flight 路径一致），
+    # 否则随后 approve 会撞 IN_PROGRESS -> PENDING_AUTH 非法转换。
+    st = load_state(root)
+    if st and st.get("plan_approved"):
+        st["plan_approved"] = False
+        st["plan_sha256"] = None
+        st["phase"] = "PLANNED"
+        save_state(root, st)
+        cur = st.get("status")
+        if cur == TaskStatus.IN_PROGRESS.value:
+            _sm_transition_task(root, TaskStatus.PLANNING, event="replan_in_flight")
+        ok("plan 已变更：原批准失效，请用户重新 harness approve。")
+    return 0
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    root = require_root()
+    return _run_script(root, "harness_validate_state.py",
+                       [str(state_path(root))])
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    root = require_root()
+    return _run_script(root, "harness_state_inspector.py", [])
+
+
+def cmd_plan_gen(args: argparse.Namespace) -> int:
+    root = require_root()
+    extra = [args.objective]
+    if args.scopes:
+        extra += ["--scopes"] + args.scopes
+    if args.task_id:
+        extra += ["--task-id", args.task_id]
+    return _run_script(root, "harness_plan_generator.py", extra)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

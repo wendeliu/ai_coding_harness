@@ -1,0 +1,8 @@
+{"ts": "2026-10-22T17:49:47+08:00", "ts_epoch": 1792662587.9497893, "event": "init", "step": null, "task_id": "TASK-20261022-174947", "objective": "test", "scopes": [], "files": []}
+{"ts": "2026-10-22T17:49:48+08:00", "ts_epoch": 1792662588.0523372, "event": "publish", "step": null, "message": "", "files": ["plan.md"]}
+{"ts": "2026-11-09T11:12:18+08:00", "ts_epoch": 1794193938.8003814, "event": "verify", "step": "S1", "message": "验收 未通过（exit=127，断言失败 1 项）：./cmd.sh", "files": [".harness/evidence/S1/20261109T111218-8b39b01a.json"]}
+{"ts": "2026-11-09T11:12:18+08:00", "ts_epoch": 1794193938.8756478, "event": "verify", "step": "S1", "message": "验收 未通过（exit=127）：./cmd.sh", "files": [".harness/evidence/S1/20261109T111218-04469b10.json"]}
+{"ts": "2026-11-09T11:12:33+08:00", "ts_epoch": 1794193953.3252244, "event": "verify", "step": "S1", "message": "验收 未通过（exit=0，断言失败 1 项）：echo hello", "files": [".harness/evidence/S1/20261109T111233-9d59c83d.json"]}
+{"ts": "2026-11-09T11:12:33+08:00", "ts_epoch": 1794193953.4016037, "event": "verify", "step": "S1", "message": "验收 通过（exit=0）：echo hello", "files": [".harness/evidence/S1/20261109T111233-5ea121cb.json"]}
+{"ts": "2026-11-09T11:13:04+08:00", "ts_epoch": 1794193984.0291471, "event": "verify", "step": "S2", "message": "验收 未通过（exit=0，断言失败 1 项）：echo x", "files": [".harness/evidence/S2/20261109T111304-463a20b3.json"]}
+{"ts": "2026-11-09T11:13:04+08:00", "ts_epoch": 1794193984.152072, "event": "verify", "step": "S2", "message": "验收 未通过（exit=0，断言失败 1 项）：echo x", "files": [".harness/evidence/S2/20261109T111304-59476ad5.json"]}
