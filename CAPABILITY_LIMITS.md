@@ -117,3 +117,25 @@ is exactly what a human can find.
 No line of code is the backstop. The person who opens the evidence and this file,
 and compares what the model claimed to verify against what it actually did, is the
 final check. The harness's job is to make the gap visible.
+## 7. State-aware command policy
+
+Every mutating subcommand is now gated by the task state machine, not just by
+transitions: `COMMAND_STATE_POLICY` in the gateway lists the allowed `status`
+values per command, and each command checks itself before doing anything.
+`replan` gets a second, independent check inside `harness_replan.py`, because the
+script can be invoked directly. The table mirrors `ALLOWED_TRANSITIONS` — a
+command is only listed for states where its transitions are legal.
+
+What this closes: a COMPLETED task can no longer be replanned, no new step can
+start, nothing can be published, verified, adopted, or aborted into. Terminal
+states (COMPLETED / ABORTED / FAILED) are read-only: `status`, `log`, `inspect`,
+`validate`, `dashboard`, `doctor`, `evidence`, and `replan list` still work.
+The intended next move after a terminal state is a new task (`harness init`),
+not surgery on the closed one.
+
+What it can't close: the policy lives in the same `.harness/scripts/` files the
+integrity lock covers. Editing them breaks the lock — which fail-closes the
+hooks, but a user running `harness _write-lock` re-signs whatever is on disk.
+Also, a state with no `status` field (handwritten legacy state.json) is treated
+as `IN_PROGRESS` and stays mutable; only states written by the machine carry the
+terminal marker.

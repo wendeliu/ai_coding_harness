@@ -45,6 +45,63 @@ SCRIPT_TIMEOUT = 300       # replan/validate/inspect 子脚本最长 5 分钟
 
 WRITE_EVENTS = ("publish", "adopt", "approve", "verify")
 
+# --------------------------------------------------------------------------- #
+# 状态感知命令闸门 / State-aware command policy
+#
+# 每个会改变任务状态的子命令只在 Task 状态机的合法状态下可用。
+# None = 任意状态放行（只读/人工运维命令）；未列出的命令一律放行。
+# 表项必须与 state_machine.py 的 ALLOWED_TRANSITIONS 一致：命令做的前置/后置
+# 转换在列出的状态下都是合法的。
+# --------------------------------------------------------------------------- #
+_ACTIVE_STATUSES = {"PLANNING", "PENDING_AUTH", "IN_PROGRESS", "PAUSED"}
+COMMAND_STATE_POLICY: Dict[str, Optional[set]] = {
+    # 只读 / 运维：任何状态（含终态）都可看
+    "status": None, "log": None, "inspect": None, "validate": None,
+    "dashboard": None, "doctor": None, "evidence": None, "branch": None,
+    "passwd": None,
+    # 生命周期命令
+    # init 不设状态闸门：非 --force 时对已有 state 只是幂等跳过；
+    # --force 是用户显式的「重启一轮」入口，正是终态任务的合法出路。
+    "init": None,
+    "plan-gen": {"CREATED", "PLANNING"},                  # 只在起草期生成骨架
+    "publish": _ACTIVE_STATUSES,
+    "approve": {"PLANNING", "PENDING_AUTH", "IN_PROGRESS"},
+    # step start 允许 IN_PROGRESS：多 step 连续推进时任务已处于 IN_PROGRESS，
+    # _sm_transition_task 对同状态幂等 no-op（「允许重复 step start」）。
+    # 首个 step 走 PENDING_AUTH -> IN_PROGRESS。
+    "step start": {"PENDING_AUTH", "IN_PROGRESS"},
+    "step done": {"IN_PROGRESS"},
+    "verify": {"IN_PROGRESS", "PAUSED"},
+    "confirm": _ACTIVE_STATUSES | {"ROLLING_BACK"},
+    "adopt": _ACTIVE_STATUSES,
+    "abort": {"PLANNING", "PENDING_AUTH", "IN_PROGRESS", "PAUSED",
+              "ROLLING_BACK"},
+    "complete": {"IN_PROGRESS"},
+    "merge": {"SUMMARIZING", "COMPLETED"},
+    "replan": _ACTIVE_STATUSES,                            # list 例外，见 cmd_replan
+}
+
+
+def _policy_check(root: Path, action: str) -> None:
+    """状态闸门：action 不在当前任务状态的允许列表则 die（fail-closed）。
+
+    state.json 缺失/不可读时不拦截（各命令自身的初始化检查兜底）；
+    state 缺 status 字段（旧版轻量 state）时视为 IN_PROGRESS 放行，
+    终态（COMPLETED/ABORTED/FAILED）一定会带 status。
+    """
+    allowed = COMMAND_STATE_POLICY.get(action)
+    if allowed is None:
+        return
+    st = load_state(root)
+    if not st:
+        return
+    cur = str(st.get("status") or st.get("phase") or "IN_PROGRESS").upper()
+    if cur not in allowed:
+        die("当前任务状态 %s 不允许执行「%s」（仅允许：%s）。\n"
+            "这是状态机的硬约束：终态任务（COMPLETED/ABORTED/FAILED）只能查看，"
+            "不能变更；如需新任务请 harness init 或让用户重启一轮。"
+            % (cur, action, ", ".join(sorted(allowed))))
+
 # 状态机（v2.2 state_machine.py，两级：Task + Step）。
 # state_machine.py 在 .harness/（scripts 的上一级），import 失败时降级为无状态机
 # （不锁死硬约束闸门）。
@@ -1076,6 +1133,7 @@ def _append_plan_revision(root: Path, line: str) -> None:
 
 def cmd_approve(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "approve")
     st = load_state(root)
     if not st:
         die("未初始化，先运行 harness init。")
@@ -1144,6 +1202,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
 
 def cmd_step_start(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "step start")
     st = load_state(root)
     if not st:
         die("未初始化。")
@@ -1185,6 +1244,7 @@ def _slug(text: str, limit: int = 20) -> str:
 
 def cmd_step_done(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "step done")
     st = load_state(root)
     if not st:
         die("未初始化。")
@@ -1297,6 +1357,7 @@ def _atomic_write(dest: Path, data: bytes) -> None:
 
 def cmd_publish(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "publish")
     st = load_state(root)
     if not st:
         die("未初始化。")
@@ -1392,6 +1453,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 def cmd_confirm(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "confirm")
     tid = args.ticket
     if not re.fullmatch(r"tkt-[A-Za-z0-9._-]{1,64}", tid):
         die("非法授权票 id。")
@@ -1576,6 +1638,7 @@ def cmd_complete(args: argparse.Namespace) -> int:
 
 def cmd_merge(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "merge")
     st = load_state(root)
     if not st:
         die("未初始化。")
@@ -1645,6 +1708,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
         "step": st.get("last_step"),
         "message": "token 授权合入 %s -> %s" % (dev, target), "files": [],
     })
+    # merge 后的状态变更（merged）必须立即提交，否则只停留在 target 的工作区，
+    # dev 分支上已提交的状态仍是 pending，两侧状态永远无法同步。
+    git_commit_all(root, "harness: merge 后状态同步 (%s -> %s)" % (dev, target))
     ok("已合入 %s -> %s（--no-ff）。开发分支 %s 保留供审计。"
        % (dev, target, dev))
     return 0
@@ -1652,6 +1718,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
 def cmd_adopt(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "adopt")
     if not args.reason.strip():
         die("必须用 --reason 说明为什么这些改动绕过 publish。")
     verify_passphrase()
@@ -2063,6 +2130,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     exit=0 只是必要条件；四道硬断言（--out/--require/--forbid/--must-differ）
     任一不过同样判 FAIL——防止「跑了但通过是空心的」。"""
     root = require_root()
+    _policy_check(root, "verify")
     st = load_state(root)
     if not st:
         die("未初始化。")
@@ -2302,6 +2370,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_abort(args: argparse.Namespace) -> int:
     root = require_root()
+    _policy_check(root, "abort")
     verify_passphrase()
 
     target = args.to
@@ -2856,6 +2925,9 @@ def cmd_replan(args: argparse.Namespace) -> int:
     root = require_root()
     if args.op == "list":
         return _run_script(root, "harness_replan.py", ["list"])
+    # list 只读、任何状态可看；变更类操作只允许活跃状态
+    # （COMPLETED/ABORTED/SUMMARIZING 等终态/准终态任务禁止 replan）。
+    _policy_check(root, "replan")
     extra = [args.op]
     if args.op == "insert":
         if not args.before and not args.after:

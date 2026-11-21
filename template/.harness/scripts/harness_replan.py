@@ -10,6 +10,8 @@
   - update:  更新 step 的元数据（title/risk/description）
 
 安全约束：
+  - 变更操作只允许活跃状态（PLANNING/PENDING_AUTH/IN_PROGRESS/PAUSED）；
+    终态任务（COMPLETED/ABORTED/FAILED）只能 list 查看
   - 重编排前必须创建 checkpoint
   - 已 COMPLETED 的 step 不能 delete（但可以 insert 后续）
   - 重编排必须记录到 plan.md Revision History
@@ -162,6 +164,24 @@ WORKLOG_JSONL = _HARNESS / "worklog.jsonl"
 class ReplanError(Exception):
     """重编排错误 / Re-planning error."""
     pass
+
+
+# 变更类 replan 操作只允许的 Task 状态（与网关 COMMAND_STATE_POLICY["replan"]
+# 一致）。list 只读、任何状态可用。终态任务（COMPLETED/ABORTED/FAILED）及
+# 准终态（SUMMARIZING/ABORTING/ROLLING_BACK）一律拒绝——结项后改任务树会
+# 破坏 evidence/manifest 与已合并产物的对应关系。此处独立校验：脚本可直接
+# 被调用，不能只依赖网关闸门。
+MUTABLE_STATUSES = {"PLANNING", "PENDING_AUTH", "IN_PROGRESS", "PAUSED"}
+
+
+def _require_mutable_status(state: dict) -> None:
+    cur = str(state.get("status") or state.get("phase")
+              or "IN_PROGRESS").upper()
+    if cur not in MUTABLE_STATUSES:
+        raise ReplanError(
+            "当前任务状态 %s 不允许 replan 变更操作（仅允许：%s）。"
+            "终态任务的任务树已与 evidence/manifest 固化对应，只能查看（replan list）。"
+            % (cur, ", ".join(sorted(MUTABLE_STATUSES))))
 
 
 def _load_state() -> dict:
@@ -695,8 +715,9 @@ Examples:
     try:
         state = _load_state()
 
-        # list 不需要 checkpoint
+        # list 不需要 checkpoint，也不做状态限制（只读）
         if args.cmd != "list":
+            _require_mutable_status(state)
             _ensure_checkpoint(state)
 
         if args.cmd == "insert":
